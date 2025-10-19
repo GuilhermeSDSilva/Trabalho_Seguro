@@ -14,6 +14,7 @@ Depois que adicionar nome.
 "/users" = Listar todos os usuarios disponiveis
 
 "/create nome_do_grupo" = Criar um grupo
+
 Ex: /create grupo1
 
 "/join nome_do_grupo" = Entrar em um grupo

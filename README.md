@@ -11,7 +11,7 @@ Apos rodar a parte do cliente, vai pedir um nome.
 # 3. Funções
 Depois que adicionar nome.
 
-"/users" = Listar todos os usuarios disponiveis
+## "/users" = Listar todos os usuarios disponiveis
 
 "/create nome_do_grupo" = Criar um grupo
 

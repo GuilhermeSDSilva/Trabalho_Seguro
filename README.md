@@ -4,10 +4,13 @@
 python server_socketio.py
 
 # 2.Criar um usuario
-python client_socketio.py 
+python client_socketio.py
+
+Apos rodar a parte do cliente, vai pedir um nome.
 
 # 3. Funções
 Depois que adicionar nome.
+
 
 /users = Listar todos os usuarios disponiveis
 

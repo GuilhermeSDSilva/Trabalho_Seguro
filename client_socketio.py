@@ -39,7 +39,7 @@ def on_message(data):
 
         # Adicionar timestamp formatado
         now = datetime.datetime.now().strftime("%d/%m/%Y %H:%M:%S")
-
+        
         if 'group' in data:
             print(f"\n[{now}] [{data['group']}] {sender} > {msg}")
         else:
@@ -71,6 +71,13 @@ def on_join_group_response(data):
         print('[erro ao entrar no grupo]', data['error'])
     else:
         print(f"[entrou no grupo: {data['group']}]")
+
+@sio.on('leave_group_response')
+def on_leave_group_response(data):
+    if data.get('error'):
+        print('[erro ao sair do grupo]', data['error'])
+    else:
+        print(f"[saiu do grupo: {data['group']}]")
 
 @sio.event
 def disconnect():
@@ -120,6 +127,16 @@ def main():
                 except Exception as e:
                     print('(Erro ao consultar /users)', e)
 
+            # Mostrar Grupos
+            elif cmd == '/groups':
+                try:
+                    res = requests.get(f"{API}/groups").json()
+                    print('\nGrupos disponíveis:')
+                    for g in res['groups']:
+                        print(f"  {g['name']} ({g['members']} membros)")
+                except Exception as e:
+                    print('(Erro ao consultar /groups)', e)
+
             # Criar grupo
             elif cmd.startswith('/create '):
                 group = cmd.split(' ', 1)[1]
@@ -129,6 +146,19 @@ def main():
             elif cmd.startswith('/join '):
                 group = cmd.split(' ', 1)[1]
                 sio.emit('join_group', {'group': group, 'user_id': user_id})
+
+            # Sair do grupo
+            elif cmd.startswith('/leave '):
+                try:
+                    group = cmd.split(' ', 1)[1].strip()
+                except IndexError:
+                    print('Formato: /leave nome_do_grupo')
+                    continue
+                
+                if not group:
+                    print('Formato: /leave nome_do_grupo')
+                    continue
+                sio.emit('leave_group', {'group': group, 'user_id': user_id})
 
             # Enviar mensagem privada
             elif cmd.startswith('@'):
@@ -214,7 +244,7 @@ def main():
             elif cmd == '/quit':
                 break
             else:
-                print('Comandos: /users, /create grupo, /join grupo, @apelido:msg, #grupo:msg, /quit')
+                print('Comandos: /users, /groups, /create grupo, /join grupo, /leave grupo, @apelido:msg, #grupo:msg, /quit')
 
     finally:
         try:

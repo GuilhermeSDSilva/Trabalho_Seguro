@@ -1,4 +1,4 @@
-# Trabalho_Seguro (Como Usar)
+# (Como Usar)
 
 # 1.Rodar o servidor
 "python server_socketio.py"

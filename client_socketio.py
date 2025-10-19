@@ -133,17 +133,31 @@ def main():
             # Enviar mensagem privada
             elif cmd.startswith('@'):
                 try:
-                    target_alias, msg = cmd[1:].split(' ', 1)
+                    # Novo formato: @apelido:mensagem. Usa o ':' como separador
+                    if ':' not in cmd[1:]:
+                         raise ValueError('Delimiter not found')
+                         
+                    target_alias, msg = cmd[1:].split(':', 1)
+                    target_alias = target_alias.strip() # Nome do usuário, incluindo espaços
+                    msg = msg.strip() # Mensagem
+                    
                 except ValueError:
-                    print('Formato: @apelido mensagem')
+                    print('Formato: @apelido:mensagem (Use o caractere ":" para separar o nome do usuário da mensagem)')
                     continue
 
+                if not target_alias or not msg:
+                    print('Formato: @apelido:mensagem (Apelido ou mensagem não pode estar vazio)')
+                    continue
+                    
                 users = requests.get(f"{API}/users").json()['users']
-                target = next((u for u in users if u['alias'].lower() == target_alias.lower()), None)
+                # Busca exata pelo alias multi-palavra (sem .lower() se o alias tiver sensibilidade a maiúsculas)
+                target = next((u for u in users if u['alias'] == target_alias), None) 
+                
                 if not target:
                     print('Usuário não encontrado.')
                     continue
 
+                # Criptografia e Envio
                 pk = target['pub_key']
                 pub_to = Pub(int(pk['n']), int(pk['g']), int(pk['n2']))
                 m_int = int.from_bytes(msg.encode(), 'big')
@@ -159,11 +173,29 @@ def main():
             # Enviar mensagem para grupo
             elif cmd.startswith('#'):
                 try:
-                    group, msg = cmd[1:].split(' ', 1)
+                    if ':' not in cmd[1:]:
+                         raise ValueError('Delimiter not found')
+                    group, msg = cmd[1:].split(':', 1)
+                    group = group.strip()
+                    msg = msg.strip()
+                    
                 except ValueError:
-                    print('Formato: #grupo mensagem')
+                    print('Formato: #grupo:mensagem (Use o caractere ":" para separar o nome do grupo da mensagem)')
                     continue
 
+                if not group or not msg:
+                    print('Formato: #grupo:mensagem (Grupo ou mensagem não pode estar vazio)')
+                    continue
+                
+                m_int = int.from_bytes(msg.encode(), 'big')
+                cipher = paillier_encrypt(pub, m_int) 
+
+                sio.emit('send_group', {
+                    'group': group,
+                    'from_id': user_id,
+                    'cipher': str(cipher),
+                    'length': len(msg)
+                })
         
                 users = requests.get(f"{API}/users").json()['users']
 
@@ -182,7 +214,7 @@ def main():
             elif cmd == '/quit':
                 break
             else:
-                print('Comandos: /users, /create grupo, /join grupo, @apelido msg, #grupo msg, /quit')
+                print('Comandos: /users, /create grupo, /join grupo, @apelido:msg, #grupo:msg, /quit')
 
     finally:
         try:

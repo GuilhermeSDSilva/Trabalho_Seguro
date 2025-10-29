@@ -3,7 +3,8 @@ import requests
 import uuid
 import threading
 import time
-from paillier import paillier_keygen, paillier_encrypt, paillier_decrypt, Pub
+import datetime
+from paillier import paillier_keygen, paillier_encrypt, paillier_decrypt, Pub, paillier_sign, paillier_verify 
 
 API = "http://127.0.0.1:5000"
 WS = "http://127.0.0.1:5000"
@@ -14,6 +15,8 @@ user_id = None
 priv = None
 pub = None
 alias = None
+
+USER_KEY_CACHE = {} 
 
 @sio.event
 def connect():
@@ -28,35 +31,66 @@ def on_register_response(data):
 
 @sio.on('message')
 def on_message(data):
-    """Recebe mensagem: {from, cipher, len, group?}"""
+    """Recebe mensagem: {from, cipher, len, group?, signature?}"""
+    global USER_KEY_CACHE
     try:
-        import datetime
-        sender = data.get('alias', data.get('from')[:8])
+        sender_id = data.get('from')
+        sender_alias = data.get('alias', sender_id[:8])
+        signature = data.get('signature') 
+        
         c = int(data.get('cipher'))
         length = int(data.get('len'))
         dec = paillier_decrypt(priv, c)
-        msg = dec.to_bytes(length, 'big').decode(errors='replace')
+        
+        try:
+            msg_bytes = dec.to_bytes(length, 'big')
+            msg = msg_bytes.decode(errors='replace')
+        except OverflowError:
+            print(f"\n[ERRO Criptográfico] Falha ao converter número para bytes. A chave privada pode estar errada, o comprimento ({length}) é insuficiente ou a cifra está corrompida.")
+            return
 
-        # Adicionar timestamp formatado
+        if sender_id != 'SYSTEM':
+            sender_pub = USER_KEY_CACHE.get(sender_id)
+            if not sender_pub:
+                users = requests.get(f"{API}/users").json()['users']
+                for u in users:
+                    if u['user_id'] == sender_id:
+                        pk = u['pub_key']
+                        e_val = int(pk.get('e', 65537)) 
+                        pub_obj = Pub(int(pk['n']), int(pk['g']), int(pk['n2']), e_val) 
+                        USER_KEY_CACHE[sender_id] = pub_obj
+                        sender_pub = pub_obj
+                        break
+            
+            if not sender_pub:
+                print(f"\n[ERRO DE SEGURANÇA] Chave pública do remetente {sender_alias} não encontrada. Mensagem Descartada.")
+                return
+
+            if not signature:
+                print(f"\n[ALERTA DE SEGURANÇA] Mensagem de {sender_alias} não possui assinatura. Mensagem Descartada.")
+                return
+
+            is_valid = paillier_verify(sender_pub, signature, msg_bytes)
+
+            if not is_valid:
+                print(f"\n[ALERTA DE SEGURANÇA] Mensagem de {sender_alias} falhou na verificação de assinatura! Mensagem Descartada.")
+                return
+        
         now = datetime.datetime.now().strftime("%d/%m/%Y %H:%M:%S")
         
         if 'group' in data:
-            print(f"\n[{now}] [{data['group']}] {sender} > {msg}")
+            print(f"\n[{now}] [{data['group']}] {sender_alias} > {msg}")
         else:
-            print(f"\n[{now}] [{sender}] > {msg}")
+            print(f"\n[{now}] [{sender_alias}] > {msg}")
+            
     except Exception as e:
-        pass
+        print(f"\n[ERRO AO PROCESSAR MENSAGEM] {e}")
 
 
 @sio.on('send_response')
 def on_send_response(data):
     if data.get('error'):
         print('[send error]', data['error'])
-    else:
-        if 'group' in data:
-            print(f"[Mensagem enviada para grupo {data['group']}]")
-        else:
-            print('[Mensagem enviada]')
 
 @sio.on('create_group_response')
 def on_create_group_response(data):
@@ -84,7 +118,7 @@ def disconnect():
     print('[disconnected]')
 
 def main():
-    global user_id, priv, pub, alias
+    global user_id, priv, pub, alias, USER_KEY_CACHE
     alias = input('Nome de usuário: ').strip()
     user_id = str(uuid.uuid4())
 
@@ -100,9 +134,7 @@ def main():
 
     print(f'[{alias}] Gerando chaves Paillier...')
     pub, priv = paillier_keygen()
-    pub_obj = {"n": str(pub.n), "g": str(pub.g), "n2": str(pub.n2)}
-
-    # conectar via Socket.IO
+    pub_obj = {"n": str(pub.n), "g": str(pub.g), "n2": str(pub.n2), "e": str(pub.e)} 
     sio.connect(WS)
 
     # registrar no servidor via evento
@@ -163,13 +195,12 @@ def main():
             # Enviar mensagem privada
             elif cmd.startswith('@'):
                 try:
-                    # Novo formato: @apelido:mensagem. Usa o ':' como separador
                     if ':' not in cmd[1:]:
                          raise ValueError('Delimiter not found')
                          
                     target_alias, msg = cmd[1:].split(':', 1)
-                    target_alias = target_alias.strip() # Nome do usuário, incluindo espaços
-                    msg = msg.strip() # Mensagem
+                    target_alias = target_alias.strip()
+                    msg = msg.strip()
                     
                 except ValueError:
                     print('Formato: @apelido:mensagem (Use o caractere ":" para separar o nome do usuário da mensagem)')
@@ -180,27 +211,29 @@ def main():
                     continue
                     
                 users = requests.get(f"{API}/users").json()['users']
-                # Busca exata pelo alias multi-palavra (sem .lower() se o alias tiver sensibilidade a maiúsculas)
                 target = next((u for u in users if u['alias'] == target_alias), None) 
                 
                 if not target:
                     print('Usuário não encontrado.')
                     continue
 
-                # Criptografia e Envio
+                # Criptografia e Assinatura
                 pk = target['pub_key']
-                pub_to = Pub(int(pk['n']), int(pk['g']), int(pk['n2']))
-                m_int = int.from_bytes(msg.encode(), 'big')
+                pub_to = Pub(int(pk['n']), int(pk['g']), int(pk['n2']), int(pk['e']))
+                msg_bytes = msg.encode()
+                m_int = int.from_bytes(msg_bytes, 'big')
                 cipher = paillier_encrypt(pub_to, m_int)
+                signature = paillier_sign(priv, msg_bytes) 
 
                 sio.emit('send', {
                     'from_id': user_id,
                     'to_id': target['user_id'],
                     'cipher': str(cipher),
-                    'length': len(msg)
+                    'length': len(msg),
+                    'signature': signature
                 })
+                print('[Mensagem enviada]')
 
-            # Enviar mensagem para grupo
             elif cmd.startswith('#'):
                 try:
                     if ':' not in cmd[1:]:
@@ -217,29 +250,39 @@ def main():
                     print('Formato: #grupo:mensagem (Grupo ou mensagem não pode estar vazio)')
                     continue
                 
-                m_int = int.from_bytes(msg.encode(), 'big')
-                cipher = paillier_encrypt(pub, m_int) 
+                msg_bytes = msg.encode()
+                m_int = int.from_bytes(msg_bytes, 'big')
+                signature = paillier_sign(priv, msg_bytes) 
+                
+                try:
+                    users = requests.get(f"{API}/users").json()['users']
+                except Exception as e:
+                    print(f"(Erro ao obter lista de usuários: {e})")
+                    print("[send error] Falha ao consultar usuários para criptografia de grupo.")
+                    continue
 
-                sio.emit('send_group', {
-                    'group': group,
-                    'from_id': user_id,
-                    'cipher': str(cipher),
-                    'length': len(msg)
-                })
-        
-                users = requests.get(f"{API}/users").json()['users']
-
+                sent_count = 0 
+                
                 for u in users:
                     pk = u['pub_key']
-                    pub_to = Pub(int(pk['n']), int(pk['g']), int(pk['n2']))
-                    m_int = int.from_bytes(msg.encode(), 'big')
+                    e_val = int(pk.get('e', 65537))
+                    pub_to = Pub(int(pk['n']), int(pk['g']), int(pk['n2']), e_val)
                     cipher = paillier_encrypt(pub_to, m_int)
+                    
                     sio.emit('send_group', {
                         'group': group,
                         'from_id': user_id,
                         'cipher': str(cipher),
-                        'length': len(msg)
+                        'length': len(msg),
+                        'signature': signature,
+                        'to_id': u['user_id']
                     })
+                    sent_count += 1
+                
+                if sent_count > 0:
+                    print(f"[Mensagem enviada para grupo {group} ({sent_count} pacotes)]")
+                else:
+                     print("[send error] Não há usuários online para envio de grupo.")
 
             elif cmd == '/quit':
                 break

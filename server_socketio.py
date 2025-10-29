@@ -36,7 +36,7 @@ def list_groups():
 # ---------------- REGISTRO ----------------
 @socketio.on('register')
 def handle_register(data):
-    """Data esperado: { user_id, alias, pub_key }"""
+    """Data esperado: { user_id, alias, pub_key: {n, g, n2, e} }"""
     user_id = data.get('user_id')
     alias = data.get('alias')
     pub_key = data.get('pub_key')
@@ -50,8 +50,12 @@ def handle_register(data):
         if user_id in clients:
             user_sid[user_id] = sid
             sid_user[sid] = user_id
+            
+            clients[user_id]['pub_key'] = pub_key 
+            
             emit('register_response', {'status': 'ok', 'note': 'reconnected'})
             return
+            
         clients[user_id] = {'alias': alias, 'pub_key': pub_key}
         messages.setdefault(user_id, [])
         user_sid[user_id] = sid
@@ -71,13 +75,14 @@ def handle_register(data):
 # ---------------- MENSAGEM DIRETA ----------------
 @socketio.on('send')
 def handle_send(data):
-    """Data esperado: { from_id, to_id, cipher, length }"""
+    """Data esperado: { from_id, to_id, cipher, length, signature }"""
     from_id = data.get('from_id')
     to_id = data.get('to_id')
     cipher = data.get('cipher')
     length = data.get('length')
+    signature = data.get('signature')
 
-    if not all([from_id, to_id, cipher, length]):
+    if not all([from_id, to_id, cipher, length, signature]):
         emit('send_response', {'error': 'Missing fields'})
         return
 
@@ -86,7 +91,7 @@ def handle_send(data):
             emit('send_response', {'error': 'User not found'})
             return
         alias = clients.get(from_id, {}).get('alias', from_id[:8])
-        msg = {'from': from_id, 'alias': alias, 'cipher': cipher, 'len': length}
+        msg = {'from': from_id, 'alias': alias, 'cipher': cipher, 'len': length, 'signature': signature} 
 
         sid = user_sid.get(to_id)
         if sid:
@@ -151,13 +156,15 @@ def handle_join_group(data):
 
 @socketio.on('send_group')
 def handle_send_group(data):
-    """Data esperado: { 'from_id', 'group', 'cipher', 'length' }"""
+    """Data esperado: { 'from_id', 'group', 'cipher', 'length', 'signature', 'to_id' }"""
     from_id = data.get('from_id')
     group = data.get('group')
     cipher = data.get('cipher')
     length = data.get('length')
+    signature = data.get('signature')
+    to_id = data.get('to_id')
 
-    if not all([from_id, group, cipher, length]):
+    if not all([from_id, group, cipher, length, signature, to_id]):
         emit('send_response', {'error': 'Missing fields'})
         return
 
@@ -165,22 +172,26 @@ def handle_send_group(data):
         if group not in groups:
             emit('send_response', {'error': 'Group not found'})
             return
-        members = groups[group].copy()
+        
+        if from_id not in groups[group]:
+             emit('send_response', {'error': 'Sender not in group'})
+             return
+             
+        if to_id not in groups[group]:
+            return 
+            
+        alias = clients.get(from_id, {}).get('alias', from_id[:8])
+        msg = {'from': from_id, 'alias': alias, 'cipher': cipher, 'len': length, 'group': group, 'signature': signature}
+        sid = user_sid.get(to_id)
 
-    alias = clients.get(from_id, {}).get('alias', from_id[:8])
-    msg = {'from': from_id, 'alias': alias, 'cipher': cipher, 'len': length, 'group': group}
-
-    for member in members:
-        if member == from_id:
-            continue
-        sid = user_sid.get(member)
         if sid:
             socketio.emit('message', msg, room=sid)
+            print(f"[group:E2EE:{group}] {from_id[:8]} → {to_id[:8]} (delivered live)")
         else:
-            messages.setdefault(member, []).append(msg)
+            messages.setdefault(to_id, []).append(msg)
+            print(f"[group:E2EE:{group}] {from_id[:8]} → {to_id[:8]} (queued)")
 
-    print(f"[group:{group}] {from_id[:8]} → {len(members)-1} membros")
-    emit('send_response', {'status': 'sent', 'group': group})
+    emit('send_response', {'status': 'sent', 'group': group}) 
 
 def _send_system_message_to_group(group_name, message):
     with lock:
@@ -189,24 +200,18 @@ def _send_system_message_to_group(group_name, message):
         
         members = groups[group_name].copy()
         
-        # 1. Busca todas as chaves públicas dos membros
         member_keys = {}
         for uid in members:
-            # Pula se a chave pública não estiver disponível
             if uid in clients and 'pub_key' in clients[uid]:
                 pk = clients[uid]['pub_key']
-                # Cria o objeto Pub para criptografia
-                pub_obj = Pub(int(pk['n']), int(pk['g']), int(pk['n2']))
+                pub_obj = Pub(int(pk['n']), int(pk['g']), int(pk['n2'])) 
                 member_keys[uid] = pub_obj
 
-    # Converte a mensagem de texto para inteiro (para criptografia)
     m_int = int.from_bytes(message.encode(), 'big')
     msg_len = len(message)
     
-    # 2. Criptografa individualmente para cada membro e envia
     for member_id, pub_key_obj in member_keys.items():
         try:
-            # Criptografa com a chave pública do destinatário
             cipher = paillier_encrypt(pub_key_obj, m_int) 
             
             msg = {
@@ -217,7 +222,6 @@ def _send_system_message_to_group(group_name, message):
                 'group': group_name
             }
             
-            # Envia para o SID específico
             sid = user_sid.get(member_id)
             if sid:
                 socketio.emit('message', msg, room=sid)

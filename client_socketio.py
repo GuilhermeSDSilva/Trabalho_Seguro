@@ -86,7 +86,6 @@ def on_message(data):
     except Exception as e:
         print(f"\n[ERRO AO PROCESSAR MENSAGEM] {e}")
 
-
 @sio.on('send_response')
 def on_send_response(data):
     if data.get('error'):
@@ -97,7 +96,7 @@ def on_create_group_response(data):
     if data.get('error'):
         print('[erro ao criar grupo]', data['error'])
     else:
-        print(f"[grupo criado: {data['group']}]")
+        print(f"[grupo criado: {data['group']}] (privacidade: {data.get('privacy', 'public')})")
 
 @sio.on('join_group_response')
 def on_join_group_response(data):
@@ -112,6 +111,13 @@ def on_leave_group_response(data):
         print('[erro ao sair do grupo]', data['error'])
     else:
         print(f"[saiu do grupo: {data['group']}]")
+
+@sio.on('invite_response')
+def on_invite_response(data):
+    if data.get('error'):
+        print('[erro ao convidar]', data['error'])
+    else:
+        print(f"[convite enviado para {data['invited']} no grupo {data['group']}]")
 
 @sio.event
 def disconnect():
@@ -165,14 +171,28 @@ def main():
                     res = requests.get(f"{API}/groups").json()
                     print('\nGrupos disponíveis:')
                     for g in res['groups']:
-                        print(f"  {g['name']} ({g['members']} membros)")
+                        print(f"  {g['name']} ({g['members']} membros) - {g.get('privacy', 'public')}")
                 except Exception as e:
                     print('(Erro ao consultar /groups)', e)
 
             # Criar grupo
             elif cmd.startswith('/create '):
-                group = cmd.split(' ', 1)[1]
-                sio.emit('create_group', {'group': group, 'user_id': user_id})
+    # Remove o comando e divide o restante
+                args = cmd[len('/create '):].strip()
+
+    # Verifica se termina com "private"
+                privacy = 'public'
+                if args.lower().endswith(' private'):
+                    privacy = 'private'
+                    args = args[: -len(' private')].strip()
+
+                group = args.strip()
+                if not group:
+                    print('Formato: /create nome_do_grupo [private]')
+                    continue
+
+                sio.emit('create_group', {'group': group, 'user_id': user_id, 'privacy': privacy})
+
 
             # Entrar em grupo
             elif cmd.startswith('/join '):
@@ -191,6 +211,25 @@ def main():
                     print('Formato: /leave nome_do_grupo')
                     continue
                 sio.emit('leave_group', {'group': group, 'user_id': user_id})
+
+            # Convidar para grupo
+            elif cmd.startswith('/invite '):
+                args = cmd[len('/invite '):].strip()
+                if ' ' not in args:
+                    print('Formato: /invite nome_do_grupo nome_da_pessoa')
+                    continue
+
+                # divide do fim para o começo
+                group, target_alias = args.rsplit(' ', 1)
+                group = group.strip()
+                target_alias = target_alias.strip()
+
+                if not group or not target_alias:
+                    print('Formato: /invite nome_do_grupo nome_da_pessoa')
+                    continue
+
+                sio.emit('invite_user', {'group': group, 'from_id': user_id, 'target_alias': target_alias})
+
 
             # Enviar mensagem privada
             elif cmd.startswith('@'):
@@ -217,7 +256,6 @@ def main():
                     print('Usuário não encontrado.')
                     continue
 
-                # Criptografia e Assinatura
                 pk = target['pub_key']
                 pub_to = Pub(int(pk['n']), int(pk['g']), int(pk['n2']), int(pk['e']))
                 msg_bytes = msg.encode()
@@ -234,6 +272,7 @@ def main():
                 })
                 print('[Mensagem enviada]')
 
+            # Enviar mensagem para grupo
             elif cmd.startswith('#'):
                 try:
                     if ':' not in cmd[1:]:
@@ -287,7 +326,7 @@ def main():
             elif cmd == '/quit':
                 break
             else:
-                print('Comandos: /users, /groups, /create grupo, /join grupo, /leave grupo, @apelido:msg, #grupo:msg, /quit')
+                print('Comandos: /users, /groups, /create grupo [private], /join grupo, /leave grupo, /invite grupo nome, @apelido:msg, #grupo:msg, /quit')
 
     finally:
         try:

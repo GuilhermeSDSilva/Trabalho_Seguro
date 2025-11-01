@@ -12,6 +12,8 @@ messages = {}     # user_id -> [ {from, cipher, len, group?} ]
 user_sid = {}     # user_id -> sid
 sid_user = {}     # sid -> user_id
 groups = {}       # group_name -> set(user_id)
+group_privacy = {}   # group_name -> 'public' ou 'private'
+group_invites = {}   # group_name -> set(user_id)
 lock = threading.Lock()
 
 @app.route("/users", methods=["GET"])
@@ -28,7 +30,7 @@ def list_groups():
     """Retorna uma lista de grupos e o número de membros."""
     with lock:
         group_list = [
-            {"name": name, "members": len(members)}
+            {"name": name, "members": len(members), "privacy": group_privacy.get(name, "public")}
             for name, members in groups.items()
         ]
     return jsonify({"groups": group_list})
@@ -106,9 +108,10 @@ def handle_send(data):
 # ---------------- GRUPOS ----------------
 @socketio.on('create_group')
 def handle_create_group(data):
-    """Data esperado: { 'group': nome_grupo, 'user_id': criador }"""
+    """Data esperado: { 'group': nome_grupo, 'user_id': criador, 'privacy': opcional }"""
     group = data.get('group')
     uid = data.get('user_id')
+    privacy = data.get('privacy', 'public')
 
     if not group or not uid:
         emit('create_group_response', {'error': 'Missing fields'})
@@ -119,9 +122,11 @@ def handle_create_group(data):
             emit('create_group_response', {'error': 'Group already exists'})
             return
         groups[group] = {uid}
+        group_privacy[group] = privacy
+        group_invites[group] = set()
 
-    print(f"[+] Grupo criado: {group} por {uid[:8]}")
-    emit('create_group_response', {'status': 'ok', 'group': group})
+    print(f"[+] Grupo criado: {group} ({privacy}) por {uid[:8]}")
+    emit('create_group_response', {'status': 'ok', 'group': group, 'privacy': privacy})
 
 
 @socketio.on('join_group')
@@ -139,19 +144,60 @@ def handle_join_group(data):
             emit('join_group_response', {'error': 'Group not found'})
             return
         
+        # Verificar se o grupo é privado
+        if group_privacy.get(group, 'public') == 'private':
+            allowed = uid in group_invites.get(group, set()) or uid in groups[group]
+            if not allowed:
+                emit('join_group_response', {'error': 'Private group — invite required'})
+                return
+        
         # Prevenção contra notificação duplicada se o usuário já estiver no grupo
         if uid in groups[group]:
             emit('join_group_response', {'status': 'ok', 'group': group, 'note': 'already member'})
             return
             
         groups[group].add(uid)
-        alias = clients.get(uid, {}).get('alias', uid[:8]) # Captura o alias para a notificação
+        alias = clients.get(uid, {}).get('alias', uid[:8])
         
     print(f"[+] {uid[:8]} entrou no grupo {group}")
     emit('join_group_response', {'status': 'ok', 'group': group})
-    
-    # Envia a notificação de entrada
     _send_system_message_to_group(group, f"{alias} entrou no grupo.")
+
+
+@socketio.on('invite_user')
+def handle_invite_user(data):
+    """Data esperado: { 'group': nome_grupo, 'from_id': quem convida, 'target_alias': nome do convidado }"""
+    group = data.get('group')
+    inviter = data.get('from_id')
+    target_alias = data.get('target_alias')
+
+    if not all([group, inviter, target_alias]):
+        emit('invite_response', {'error': 'Missing fields'})
+        return
+
+    with lock:
+        if group not in groups:
+            emit('invite_response', {'error': 'Group not found'})
+            return
+
+        if group_privacy.get(group, 'public') != 'private':
+            emit('invite_response', {'error': 'Group is not private'})
+            return
+
+        target_id = None
+        for uid, info in clients.items():
+            if info.get('alias') == target_alias:
+                target_id = uid
+                break
+
+        if not target_id:
+            emit('invite_response', {'error': 'User not found'})
+            return
+
+        group_invites[group].add(target_id)
+
+    print(f"[INVITE] {inviter[:8]} convidou {target_alias} para o grupo {group}")
+    emit('invite_response', {'status': 'ok', 'group': group, 'invited': target_alias})
 
 
 @socketio.on('send_group')
@@ -250,8 +296,6 @@ def handle_leave_group(data):
         
         if uid in groups[group]:
             groups[group].remove(uid)
-            
-            # Remove o grupo se estiver vazio
             is_deleted = False
             if not groups[group]:
                 del groups[group]
@@ -265,8 +309,7 @@ def handle_leave_group(data):
     print(f"[-] {uid[:8]} saiu do grupo {group}")
     emit('leave_group_response', {'status': 'ok', 'group': group})
     
-    # NOTIFICAÇÃO
-    if not is_deleted: # Envia a notificação se o grupo ainda existir
+    if not is_deleted:
         _send_system_message_to_group(group, f"{alias} saiu do grupo.")
 
 # ---------------- DESCONECTAR ----------------

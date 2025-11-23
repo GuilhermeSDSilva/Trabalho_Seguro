@@ -9,6 +9,7 @@ import time
 import pickle
 import os
 import sys
+import json
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
@@ -81,46 +82,55 @@ class SecureChatClient:
                 if sender_id == self.user_id:
                     return 
                 
-                sender_alias = data.get('alias', sender_id[:8])
+                sender_alias = data.get('alias')
+                if not sender_alias:
+                    sender_alias = self._resolve_sender_name(sender_id)
+                # --------------------------------------------------------
+
                 signature = data.get('signature')
                 c = int(data.get('cipher'))
                 length = int(data.get('len'))
                 
+                # Descriptografia
                 dec = paillier_decrypt(self.priv, c)
                 
                 try:
                     msg_bytes = dec.to_bytes(length, 'big')
                     msg = msg_bytes.decode(errors='replace')
                 except OverflowError:
-                    self.put_system_message(f"[ERRO Criptográfico] Falha ao decodificar mensagem de {sender_alias}.")
+                    self.put_system_message(f"[ERRO] Falha ao decodificar msg de {sender_alias}.")
                     return
 
+                # Verificação de Assinatura
                 if sender_id != 'SYSTEM':
                     sender_pub = self._get_user_pubkey(sender_id)
                     
                     if not sender_pub:
-                        self.put_system_message(f"[ERRO DE SEGURANÇA] Chave pública de {sender_alias} não encontrada. Mensagem Descartada.")
+                        self.put_system_message(f"[ERRO] Chave pública de {sender_alias} não encontrada.")
                         return
 
                     if not signature:
-                        self.put_system_message(f"[ALERTA DE SEGURANÇA] Mensagem de {sender_alias} não possui assinatura. Mensagem Descartada.")
+                        self.put_system_message(f"[ALERTA] Msg de {sender_alias} sem assinatura.")
                         return
 
                     is_valid = paillier_verify(sender_pub, signature, msg_bytes)
 
                     if not is_valid:
-                        self.put_system_message(f"[ALERTA DE SEGURANÇA] Mensagem de {sender_alias} falhou na verificação de assinatura! Mensagem Descartada.")
+                        self.put_system_message(f"[ALERTA] Assinatura falsa de {sender_alias}!")
                         return
                 
+                # Formatar nome para exibição
                 group_name = data.get('group')
                 display_sender = f"{sender_alias}"
+                
                 if group_name:
                     display_sender += f" (no #{group_name})"
                 
                 if sender_id == 'SYSTEM':
                     self.put_system_message(f"[{display_sender}] {msg}")
                 else:
-                    self.put_chat_message(msg, display_sender, "user")
+                    # Agora passamos o 'display_sender' que contém o NOME correto, não o ID
+                    self.put_chat_message(msg, display_sender, "user", signature=signature)
 
             except Exception as e:
                 self.put_system_message(f"[ERRO AO PROCESSAR MENSAGEM] {e}")
@@ -158,17 +168,25 @@ class SecureChatClient:
             self.put_system_message("[Desconectado do servidor]")
     
     # --- Funções de Mensagem  ---
-    def put_chat_message(self, content, sender, avatar):
-        now = datetime.datetime.now().strftime("%H:%M:%S")
-        self.message_queue.put({
-            "content": content, "sender": sender, "avatar": avatar, 
-            "timestamp": now, "type": "chat"
-        })
     def put_system_message(self, content):
         now = datetime.datetime.now().strftime("%H:%M:%S")
         self.message_queue.put({
-            "content": content, "sender": "Sistema", "avatar": "assistant", 
-            "timestamp": now, "type": "system"
+            "content": content, 
+            "sender": "Sistema", 
+            "avatar": "assistant", 
+            "timestamp": now, 
+            "type": "system"
+        })
+
+    def put_chat_message(self, content, sender, avatar, signature=None):
+        now = datetime.datetime.now().strftime("%H:%M:%S")
+        self.message_queue.put({
+            "content": content, 
+            "sender": sender, 
+            "avatar": avatar, 
+            "timestamp": now, 
+            "type": "chat",
+            "signature": signature # Importante para deduplicação
         })
 
     # --- Funções Auxiliares ---
@@ -241,6 +259,22 @@ class SecureChatClient:
         except Exception as e:
             self.put_system_message(f"Erro ao carregar identidade {filename}: {e}")
             return False
+        
+    def _resolve_sender_name(self, user_id):
+        """Busca na API quem é o dono deste ID para mostrar o nome correto"""
+        try:
+            # Busca a lista de usuários do servidor
+            resp = requests.get(f"{API}/users")
+            if resp.status_code == 200:
+                users = resp.json().get('users', [])
+                for u in users:
+                    if u['user_id'] == user_id:
+                        return u['alias']
+        except Exception as e:
+            print(f"Erro ao resolver nome: {e}")
+        
+        # Se não achar (ou der erro), retorna os 8 primeiros digitos do ID
+        return user_id[:8]
 
     # LÓGICA DE LOGIN 
     def login(self, alias):
@@ -336,33 +370,59 @@ class SecureChatClient:
 
     def send_group_message(self, group, msg):
         try:
+            # 1. Buscar membros do grupo especificamente (rota existente no server)
+            resp = requests.get(f"{API}/groups/{group}/members")
+            if resp.status_code != 200:
+                self.put_system_message(f"Erro ao buscar membros do grupo: {resp.text}")
+                return
+            
+            members = resp.json().get('members', [])
+            
+            # 2. Preparar dados
             msg_bytes = msg.encode()
             m_int = int.from_bytes(msg_bytes, 'big')
             signature = paillier_sign(self.priv, msg_bytes)
             
-            users = requests.get(f"{API}/users").json()['users']
+            # Buscar chaves públicas de todos os usuários para cruzar com os membros
+            all_users = requests.get(f"{API}/users").json()['users']
+            users_map = {u['user_id']: u for u in all_users}
+            
+            bundle = {}
             sent_count = 0
             
-            for u in users:
-                pk = u['pub_key']
+            # 3. Criptografar para cada membro do grupo
+            for member_id in members:
+                # Pula o próprio remetente (opcional, mas economiza processamento)
+                if member_id == self.user_id:
+                    continue
+                
+                user_data = users_map.get(member_id)
+                if not user_data:
+                    continue
+
+                pk = user_data['pub_key']
+                # Garante que os valores são inteiros
                 e_val = int(pk.get('e', 65537))
                 pub_to = Pub(int(pk['n']), int(pk['g']), int(pk['n2']), e_val)
+                
                 cipher = paillier_encrypt(pub_to, m_int)
                 
-                self.sio.emit('send_group', {
-                    'group': group,
-                    'from_id': self.user_id,
-                    'cipher': str(cipher),
-                    'length': len(msg_bytes),
-                    'signature': signature,
-                    'to_id': u['user_id']
-                })
+                # Adiciona ao bundle: { user_id: { 'c': cifrado, 'l': tamanho } }
+                bundle[member_id] = {'c': str(cipher), 'l': len(msg_bytes)}
                 sent_count += 1
             
             if sent_count > 0:
-                self.put_chat_message(msg, f"Você para #{group}", "user")
+                # 4. Enviar UM ÚNICO evento com o 'bundle' completo
+                self.sio.emit('send_group', {
+                    'group': group,
+                    'from_id': self.user_id,
+                    'bundle': bundle,   # O servidor espera este campo
+                    'signature': signature
+                })
+                self.put_chat_message(msg, f"Você para #{group}", "user", signature=signature)
             else:
-                self.put_system_message("[Erro de Envio] Não há usuários online para criptografar a mensagem de grupo.")
+                self.put_system_message(f"Não há outros membros no grupo '{group}' para receber a mensagem.")
+                
         except Exception as e:
             self.put_system_message(f"Erro ao enviar para grupo: {e}")
 
@@ -403,6 +463,30 @@ class SecureChatClient:
         except Exception as e:
             self.put_system_message(f"Erro ao processar comando: {e}")
 
+# ----- Funções de armazenamento -----
+def get_history_file(alias):
+    # Salva na pasta keys para manter organizado, ou na raiz
+    return os.path.join("keys", f"history_{alias}.json")
+
+def save_history(alias, messages):
+    if not alias: return
+    try:
+        with open(get_history_file(alias), 'w', encoding='utf-8') as f:
+            json.dump(messages, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"Erro ao salvar histórico: {e}")
+
+def load_history(alias):
+    if not alias: return []
+    path = get_history_file(alias)
+    if os.path.exists(path):
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except Exception as e:
+            print(f"Erro ao carregar histórico: {e}")
+    return []
+
 
 # --- Interface Streamlit  ---
 def main():
@@ -418,29 +502,49 @@ def main():
 
     client = st.session_state.client
 
+    # --- PROCESSAMENTO DA FILA COM DEDUPLICAÇÃO E SALVAMENTO ---
     while not st.session_state.message_queue.empty():
         msg = st.session_state.message_queue.get()
+        
         if msg.get("type") == "chat":
-            st.session_state.chat_messages.append(msg)
+            # Deduplicação: Verifica se já existe mensagem com mesma assinatura
+            # O servidor reenvia histórico de grupos ao reconectar, então isso é vital.
+            is_duplicate = False
+            new_sig = msg.get("signature")
+            
+            if new_sig: # Só verifica se tiver assinatura
+                for old_msg in st.session_state.chat_messages:
+                    if old_msg.get("signature") == new_sig:
+                        is_duplicate = True
+                        break
+            
+            if not is_duplicate:
+                st.session_state.chat_messages.append(msg)
+                # Salvar histórico sempre que chegar mensagem nova e tivermos um alias logado
+                if client.alias:
+                    save_history(client.alias, st.session_state.chat_messages)
+                    
         else:
             st.session_state.system_notifications.append(msg)
         
     # --- Tela de Login ---
     if not client.alias:
         st.title("Trabalho Seguro - Login ou Registro")
-        alias_input = st.text_input("Seu nome de usuário:", key="alias_input", 
-                                  help="Se o nome já existir localmente, fará login. Se não, tentará registrar.")
+        alias_input = st.text_input("Seu nome de usuário:", key="alias_input")
         
         if st.button("Entrar / Registrar"):
             if alias_input:
                 with st.spinner("Conectando..."):
                     if client.login(alias_input):
+                        # --- CARREGAR HISTÓRICO AO LOGAR ---
+                        history = load_history(alias_input)
+                        if history:
+                            st.session_state.chat_messages = history
+                            client.put_system_message(f"Histórico carregado: {len(history)} mensagens.")
+                        
                         st.session_state.users = requests.get(f"{API}/users").json().get('users', [])
                         st.session_state.groups = requests.get(f"{API}/groups").json().get('groups', [])
                         st.rerun() 
-                    else:
-                        # Erro já foi postado nas notificações
-                        pass
             else:
                 st.error("Por favor, insira um nome de usuário.")
     

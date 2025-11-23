@@ -9,6 +9,7 @@ import sys
 import sqlite3
 import tempfile
 import base64
+import json
 
 # NOVO (para senha da chave)
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
@@ -16,7 +17,10 @@ from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import hashes
 from cryptography.fernet import Fernet
 
+import pyotp
+
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
 from paillier import paillier_keygen, paillier_encrypt, paillier_decrypt, Pub, paillier_sign, paillier_verify
 
 API = "http://127.0.0.1:5000"
@@ -31,7 +35,13 @@ alias = None
 
 DB_PATH = "messages.db"
 ENC_DB_PATH = DB_PATH + ".enc"
-KEY_DIR = "keys"
+# KEY_DIR: tenta localizar as keys (frontend/keys ou backend/keys)
+POSSIBLE_KEY_DIRS = [
+    os.path.join(os.path.dirname(__file__), '..', 'frontend', 'keys'),
+    os.path.join(os.path.dirname(__file__), 'keys'),
+]
+KEY_DIR = next((p for p in POSSIBLE_KEY_DIRS if os.path.exists(p)), POSSIBLE_KEY_DIRS[0])
+os.makedirs(KEY_DIR, exist_ok=True)
 
 # NOVO — chave Fernet criptografada por senha
 KEY_ENC_PATH = os.path.join(KEY_DIR, "fernet.key.enc")
@@ -214,40 +224,122 @@ def fetch_history(limit=200):
 
 USER_KEY_CACHE = {}
 
+# ---------- Helpers para persistência de user_id e leitura de totp secret ----------
+def get_userid_path_for(alias):
+    return os.path.join(KEY_DIR, f"{alias}.id")
 
+def persist_user_id(alias, uid):
+    path = get_userid_path_for(alias)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(uid)
+
+def load_persisted_user_id(alias):
+    path = get_userid_path_for(alias)
+    if os.path.exists(path):
+        return open(path, "r", encoding="utf-8").read().strip()
+    return None
+
+def load_local_totp_secret(alias):
+    """
+    Lê o arquivo frontend/keys/<alias>.key e retorna o secret TOTP.
+    Aceita texto puro ou JSON com {"totp_secret": "..."}.
+    """
+    key_path = os.path.join(KEY_DIR, f"{alias}.key")
+    if not os.path.exists(key_path):
+        print(f"[2FA] Nenhum arquivo de chave encontrado para {alias} em {KEY_DIR}")
+        return None
+
+    try:
+        content = open(key_path, "r", encoding="utf-8").read().strip()
+        # tentar JSON
+        try:
+            data = json.loads(content)
+            return data.get("totp_secret") or data.get("secret")
+        except:
+            # não era JSON → assume secret puro
+            return content
+    except Exception as e:
+        print("[2FA] Erro lendo secret local:", e)
+        return None
+
+# ------------------ SOCKET.IO EVENTS ------------------
 @sio.event
 def connect():
     print('[connected to server]')
 
-
 @sio.on('register_response')
 def on_register_response(data):
+    global user_id, alias
     if data.get('error'):
         print('[register error]', data['error'])
-    else:
-        print('[registered]', data)
+        return
 
+    print('[registered]', data)
+
+    # update local alias/user_id if provided by server
+    server_user_id = data.get('user_id')
+    server_alias = data.get('alias') or alias
+
+    if server_alias:
+        alias = server_alias
+
+    # if server returned user_id (new registration or reconnection), persist it locally
+    if server_user_id:
+        user_id = server_user_id
+        try:
+            persist_user_id(alias, user_id)
+        except Exception as e:
+            print("[WARN] falha ao persistir user_id:", e)
+
+    # If the server provided totp_secret (first time registration), show it and optionally save
+    if data.get('totp_secret'):
+        print("[2FA] Novo TOTP secret recebido (salve no seu authenticator):", data['totp_secret'])
+        # Optionally: you may want to save this secret to KEY_DIR/<alias>.key in JSON form
+        # but we will not overwrite existing keys automatically.
+
+    # If status ok, attempt auto 2FA login by reading local secret
+    if data.get('status') == 'ok':
+        print(f"[2FA] Tentando auto-login 2FA para {alias} (user {user_id[:8]})...")
+        secret = load_local_totp_secret(alias)
+        if not secret:
+            print("[2FA] Nenhum secret local encontrado. Auto-login impossível.")
+            return
+
+        try:
+            token = pyotp.TOTP(secret).now()
+            print("[2FA] token gerado (auto):", token)
+            # opcional: enviar token no register também (server aceita token opcional)
+            sio.emit("login_2fa", {"user_id": user_id, "token": token})
+            print("[2FA] login_2fa enviado automaticamente.")
+        except Exception as e:
+            print("[2FA] Erro gerando/enviando TOTP token:", e)
 
 @sio.on('message')
 def on_message(data):
-    global USER_KEY_CACHE
+    global USER_KEY_CACHE, priv
     try:
         sender_id = data.get('from')
         sender_alias = data.get('alias', sender_id[:8])
         signature = data.get('signature')
 
-        c = int(data.get('cipher'))
-        length = int(data.get('len'))
+        # cipher pode ser string do numero grande (paillier)
+        c_raw = data.get('cipher')
+        if c_raw is None:
+            print("[ERRO] Mensagem sem campo 'cipher'. Ignorando.")
+            return
+
+        c = int(c_raw)
+        length = int(data.get('len', 0))
         dec = paillier_decrypt(priv, c)
 
         msg_bytes = dec.to_bytes(length, 'big')
         msg = msg_bytes.decode(errors='replace')
 
-        # assinaturas
-        if sender_id != 'SYSTEM':
+        # assinaturas (só para mensagens que não são SYSTEM)
+        if sender_id and sender_id != 'SYSTEM':
             sender_pub = USER_KEY_CACHE.get(sender_id)
             if not sender_pub:
-                users = requests.get(f"{API}/users").json()['users']
+                users = requests.get(f"{API}/users").json().get('users', [])
                 for u in users:
                     if u['user_id'] == sender_id:
                         pk = u['pub_key']
@@ -273,60 +365,83 @@ def on_message(data):
 
         if 'group' in data:
             print(f"\n[{now}] [{data['group']}] {sender_alias} > {msg}")
+            save_message(now, sender_alias, None, msg, data.get('group'))
         else:
             print(f"\n[{now}] [{sender_alias}] > {msg}")
-
-        save_message(now, sender_alias, None if 'group' in data else data.get('to'), msg, data.get('group'))
+            save_message(now, sender_alias, data.get('to'), msg, None)
 
     except Exception as e:
         print(f"[ERRO AO PROCESSAR MENSAGEM] {e}")
-
 
 @sio.on('send_response')
 def on_send_response(data):
     if data.get('error'):
         print('[send error]', data['error'])
 
+# ------------------ MAIN CLIENT LOGIC ------------------
+def ensure_user_id_for_alias(chosen_alias):
+    """
+    Mantém user_id persistente por alias (arquivo keys/<alias>.id).
+    Se existir, reutiliza. Se não, gera novo e persiste.
+    """
+    existing = load_persisted_user_id(chosen_alias)
+    if existing:
+        return existing
+    new_id = str(uuid.uuid4())
+    persist_user_id(chosen_alias, new_id)
+    return new_id
+
+def build_bundle_for_group(group, msg_bytes):
+    """
+    Monta o bundle { user_id: {"c": "<ciphertext>", "l": N}, ... }
+    Requer que o servidor disponibilize /groups/<group>/members e /users.
+    """
+    # buscar membros do grupo
+    resp = requests.get(f"{API}/groups/{group}/members")
+    if resp.status_code != 200:
+        raise RuntimeError("Failed to fetch group members: " + resp.text)
+    members = resp.json().get('members', [])
+    if not members:
+        raise RuntimeError("Group has no members or does not exist")
+
+    # buscar lista de users para mapear pubkeys
+    users = requests.get(f"{API}/users").json().get('users', [])
+
+    users_map = {u['user_id']: u for u in users}
+
+    m_int = int.from_bytes(msg_bytes, 'big')
+    bundle = {}
+    for member in members:
+        # pula o remetente
+        if member == user_id:
+            continue
+        u = users_map.get(member)
+        if not u:
+            # se pubkey não encontrada, pula (cliente pode avisar)
+            print(f"[WARN] pubkey não encontrada para membro {member[:8]}, pulando")
+            continue
+        pk = u['pub_key']
+        pub_to = Pub(int(pk['n']), int(pk['g']), int(pk['n2']), int(pk.get('e', 65537)))
+        cipher = paillier_encrypt(pub_to, m_int)
+        bundle[member] = {"c": str(cipher), "l": len(msg_bytes)}
+    return bundle
 
 def main():
     global user_id, priv, pub, alias, USER_KEY_CACHE, FERNET_INSTANCE
 
-    # Senha obrigatória antes de tudo
+    # Senha obrigatória antes de tudo (db criptografado)
     init_master_key()
     FERNET_INSTANCE = unlock_master_key()
 
     init_db()
 
     alias = input('Nome de usuário: ').strip()
-    user_id = str(uuid.uuid4())
+    # persistir/reutilizar o user_id para o mesmo alias
+    user_id = ensure_user_id_for_alias(alias)
 
-    print(f'[{alias}] Gerando chaves Paillier...')
+    # gera chaves (ou, se você quiser, poderia carregar chaves existentes de KEY_DIR/<alias>.key)
+    print(f'[{alias}] Gerando chaves Paillier (ou usando as existentes)...')
     pub, priv = paillier_keygen()
-
-
-    print("\n" + "="*60)
-    print("  DETALHES COMPLETOS DA GERAÇÃO DE CHAVES (Terminal Local)")
-    print("="*60)
-    
-    print("\n[ 1. CHAVE PÚBLICA (Pub) GERADA ] - (Enviada ao Servidor)")
-    print("---------------------------------------------------------")
-    print(f"  n (Módulo):\n  {pub.n}")
-    print("\n")
-    print(f"  g (Gerador Paillier):\n  {pub.g}")
-    print("\n")
-    print(f"  e (Expoente RSA):\n  {pub.e}")
-
-    print("\n\n[ 2. CHAVE PRIVADA (Priv) GERADA ] - (Mantida 100% local)")
-    print("---------------------------------------------------------")
-    print(f"  d (Expoente RSA):\n  {priv.d}")
-    print("\n")
-    print(f"  lambda (Segredo Paillier):\n  {priv.lam}")
-    print("\n")
-    print(f"  mu (Inverso Paillier):\n  {priv.mu}")
-    
-    print("\n" + "="*60)
-    print("Chaves geradas. Enviando Chave Pública para o servidor...")
-    print("="*60 + "\n")
 
     pub_obj = {
         "n": str(pub.n),
@@ -335,8 +450,9 @@ def main():
         "e": str(pub.e)
     }
 
-    sio.connect(WS)
+    sio.connect(WS, wait=True)
 
+    # envia register. Note: pode incluir token opcional se quiser (não necessário, pois o cliente vai emitir login_2fa automaticamente ao receber response)
     sio.emit('register', {
         'user_id': user_id,
         'alias': alias,
@@ -350,7 +466,7 @@ def main():
             if cmd == '/users':
                 try:
                     res = requests.get(f"{API}/users").json()
-                    print('Usuários online:')
+                    print('Usuários no servidor:')
                     for u in res['users']:
                         print(f"  {u['alias']} ({u['user_id'][:8]})")
                 except Exception as e:
@@ -440,25 +556,23 @@ def main():
                 group, msg = cmd[1:].split(':', 1)
                 msg = msg.strip()
 
-                users = requests.get(f"{API}/users").json()['users']
-
                 msg_bytes = msg.encode()
-                m_int = int.from_bytes(msg_bytes, 'big')
                 signature = paillier_sign(priv, msg_bytes)
 
-                for u in users:
-                    pk = u['pub_key']
-                    pub_to = Pub(int(pk['n']), int(pk['g']), int(pk['n2']), int(pk.get('e', 65537)))
-                    cipher = paillier_encrypt(pub_to, m_int)
+                # Monta bundle com encryptions para cada membro (servidor tem rota /groups/<group>/members)
+                try:
+                    bundle = build_bundle_for_group(group, msg_bytes)
+                except Exception as e:
+                    print("[Erro ao montar bundle]", e)
+                    continue
 
-                    sio.emit('send_group', {
-                        'group': group,
-                        'from_id': user_id,
-                        'cipher': str(cipher),
-                        'length': len(msg),
-                        'signature': signature,
-                        'to_id': u['user_id']
-                    })
+                # Envia UM ÚNICO send_group com bundle
+                sio.emit('send_group', {
+                    'group': group,
+                    'from_id': user_id,
+                    'bundle': bundle,
+                    'signature': signature
+                })
 
                 now = datetime.datetime.now().strftime("%d/%m/%Y %H:%M:%S")
                 save_message(now, alias, f"grupo:{group}", msg, group)
@@ -487,7 +601,6 @@ def main():
 
     finally:
         sio.disconnect()
-
 
 if __name__ == '__main__':
     main()

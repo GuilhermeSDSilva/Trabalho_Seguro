@@ -1,51 +1,228 @@
 import sys
 import os
-
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-
+import sqlite3
+import json
+import time
+import threading
+import pyotp
 from flask import Flask, request, jsonify
 from flask_socketio import SocketIO, emit
-import threading
-from paillier import Pub, paillier_encrypt
 
-
+# opcional: caminho do seu projeto
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 app = Flask(__name__)
 socketio = SocketIO(app, cors_allowed_origins="*")
 
-# Armazenamento em memória
-clients = {}      # user_id -> {alias, pub_key}
-messages = {}     # user_id -> [ {from, cipher, len, group?} ]
-user_sid = {}     # user_id -> sid
-sid_user = {}     # sid -> user_id
-groups = {}       # group_name -> set(user_id)
-group_privacy = {}   # group_name -> 'public' ou 'private'
-group_invites = {}   # group_name -> set(user_id)
+DB_FILE = "chat_seguro.db"
 lock = threading.Lock()
 
+# --- Em memória apenas para sessão (sids) ---
+user_sid = {}     # user_id -> sid
+sid_user = {}     # sid -> user_id
+
+# --- BANCO DE DADOS: inicialização e helpers ---
+def init_db():
+    with sqlite3.connect(DB_FILE) as conn:
+        c = conn.cursor()
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS users (
+                user_id TEXT PRIMARY KEY,
+                alias TEXT UNIQUE,
+                pub_key TEXT,
+                totp_secret TEXT
+            )
+        ''')
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                from_id TEXT,
+                to_id TEXT,
+                group_id TEXT,
+                content_blob TEXT,
+                signature TEXT,
+                timestamp REAL
+            )
+        ''')
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS groups (
+                name TEXT PRIMARY KEY,
+                owner_id TEXT,
+                privacy TEXT
+            )
+        ''')
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS group_members (
+                group_name TEXT,
+                user_id TEXT,
+                PRIMARY KEY (group_name, user_id)
+            )
+        ''')
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS group_invites (
+                group_name TEXT,
+                user_id TEXT,
+                PRIMARY KEY (group_name, user_id)
+            )
+        ''')
+        conn.commit()
+
+init_db()
+
+# --- Funções utilitárias de DB ---
+def db_get_user_by_alias(alias):
+    with sqlite3.connect(DB_FILE) as conn:
+        conn.row_factory = sqlite3.Row
+        return conn.execute("SELECT * FROM users WHERE alias = ?", (alias,)).fetchone()
+
+def db_get_user_by_id(uid):
+    with sqlite3.connect(DB_FILE) as conn:
+        conn.row_factory = sqlite3.Row
+        return conn.execute("SELECT * FROM users WHERE user_id = ?", (uid,)).fetchone()
+
+def db_add_user(user_id, alias, pub_key, totp_secret):
+    with sqlite3.connect(DB_FILE) as conn:
+        conn.execute("INSERT INTO users (user_id, alias, pub_key, totp_secret) VALUES (?, ?, ?, ?)",
+                     (user_id, alias, json.dumps(pub_key), totp_secret))
+        conn.commit()
+
+def db_update_pubkey(user_id, pub_key):
+    with sqlite3.connect(DB_FILE) as conn:
+        conn.execute("UPDATE users SET pub_key = ? WHERE user_id = ?", (json.dumps(pub_key), user_id))
+        conn.commit()
+
+def db_insert_message(from_id, to_id, group_id, content_blob, signature):
+    with sqlite3.connect(DB_FILE) as conn:
+        conn.execute("INSERT INTO messages (from_id, to_id, group_id, content_blob, signature, timestamp) VALUES (?, ?, ?, ?, ?, ?)",
+                     (from_id, to_id, group_id, json.dumps(content_blob), signature, time.time()))
+        conn.commit()
+
+def db_get_pending_for_user(uid):
+    """
+    Retorna listas de mensagens diretas e mensagens de grupo onde exista um pacote
+    destinado a uid (quando group_id is not null)
+    """
+    result = []
+    with sqlite3.connect(DB_FILE) as conn:
+        conn.row_factory = sqlite3.Row
+        # mensagens diretas
+        rows = conn.execute("SELECT * FROM messages WHERE to_id = ? ORDER BY timestamp ASC", (uid,)).fetchall()
+        for r in rows:
+            item = dict(r)
+            try: item['content_blob'] = json.loads(r['content_blob'])
+            except: pass
+            result.append(item)
+        # mensagens em grupo: pega todas e filtra se o bundle contém uid
+        rows = conn.execute("SELECT * FROM messages WHERE group_id IS NOT NULL ORDER BY timestamp ASC").fetchall()
+        for r in rows:
+            try:
+                blob = json.loads(r['content_blob'])
+                # blob tem formato { "<user_id>": {"c": "...", "l": N}, ... }
+                if uid in blob:
+                    item = dict(r)
+                    item['content_blob'] = blob
+                    result.append(item)
+            except:
+                continue
+    return result
+
+def db_get_groups():
+    with sqlite3.connect(DB_FILE) as conn:
+        conn.row_factory = sqlite3.Row
+        return conn.execute("SELECT * FROM groups").fetchall()
+
+def db_get_group_members(group_name):
+    with sqlite3.connect(DB_FILE) as conn:
+        return [row[0] for row in conn.execute("SELECT user_id FROM group_members WHERE group_name=?", (group_name,)).fetchall()]
+
+# --- ROTAS HTTP: exposição (users/groups/debug) ---
 @app.route("/users", methods=["GET"])
 def list_users():
-    with lock:
-        user_list = [
-            {"user_id": uid, "alias": info["alias"], "pub_key": info["pub_key"]}
-            for uid, info in clients.items()
-        ]
-    return jsonify({"users": user_list})
+    with sqlite3.connect(DB_FILE) as conn:
+        conn.row_factory = sqlite3.Row
+        users = conn.execute("SELECT user_id, alias, pub_key FROM users").fetchall()
+        result = []
+        for u in users:
+            d = dict(u)
+            try: d['pub_key'] = json.loads(u['pub_key'])
+            except: pass
+            result.append(d)
+    return jsonify({"users": result})
 
 @app.route("/groups", methods=["GET"])
 def list_groups():
-    """Retorna uma lista de grupos e o número de membros."""
-    with lock:
-        group_list = [
-            {"name": name, "members": len(members), "privacy": group_privacy.get(name, "public")}
-            for name, members in groups.items()
-        ]
-    return jsonify({"groups": group_list})
+    with sqlite3.connect(DB_FILE) as conn:
+        conn.row_factory = sqlite3.Row
+        groups_db = conn.execute("SELECT * FROM groups").fetchall()
+        result = []
+        for g in groups_db:
+            gd = dict(g)
+            members = db_get_group_members(g['name'])
+            gd['members'] = len(members)
+            result.append(gd)
+    return jsonify({"groups": result})
 
-# ---------------- REGISTRO (COM CORREÇÃO) ----------------
+@app.route("/groups/<group_name>/members", methods=["GET"])
+def get_group_members_route(group_name):
+    """
+    Retorna os user_ids membros do grupo.
+    Usado pelo cliente para montar o bundle de grupo.
+    """
+    members = db_get_group_members(group_name)
+    return jsonify({"members": members})
+
+@app.route("/debug/inspector", methods=["GET"])
+def inspector():
+    """
+    Rota de auditoria: expõe todo o estado salvo no DB (usuarios, mensagens, grupos).
+    ATENÇÃO: contém chaves públicas e secrets TOTP.
+    """
+    with sqlite3.connect(DB_FILE) as conn:
+        conn.row_factory = sqlite3.Row
+        users_db = conn.execute("SELECT * FROM users").fetchall()
+        users_list = []
+        for u in users_db:
+            u_dict = dict(u)
+            try: u_dict['pub_key'] = json.loads(u['pub_key'])
+            except: pass
+            users_list.append(u_dict)
+
+        msgs_db = conn.execute("SELECT * FROM messages").fetchall()
+        msgs_list = []
+        for m in msgs_db:
+            md = dict(m)
+            try: md['content_blob'] = json.loads(m['content_blob'])
+            except: pass
+            msgs_list.append(md)
+
+        groups_list = [dict(g) for g in conn.execute("SELECT * FROM groups").fetchall()]
+        # adicionar membros e invites
+        for g in groups_list:
+            g['members'] = db_get_group_members(g['name'])
+            invites = conn.execute("SELECT user_id FROM group_invites WHERE group_name=?", (g['name'],)).fetchall()
+            g['invites'] = [i[0] for i in invites]
+
+    return jsonify({
+        "SERVER_STATUS": "ONLINE (Modo Auditoria)",
+        "AUDITORIA_TOTAL": {
+            "TOTAL_USUARIOS": len(users_list),
+            "LISTA_USUARIOS": users_list,
+            "TOTAL_MENSAGENS": len(msgs_list),
+            "HISTORICO_MENSAGENS": msgs_list,
+            "GRUPOS": groups_list
+        }
+    })
+
+# --- SOCKET.IO: registro, login 2FA, envio e entrega de mensagens ---
 @socketio.on('register')
 def handle_register(data):
-    """Data esperado: { user_id, alias, pub_key: {n, g, n2, e} }"""
+    """
+    Esperado: { user_id, alias, pub_key }
+    Se novo: cria entrada em users com totp_secret e retorna totp_secret (para ser exibido como QR/TXT no client)
+    Se alias existente por outro user -> erro
+    Se user_id já existe -> reconexão (atualiza sid e pub_key)
+    Opcional: o cliente pode enviar 'token' no register para auto-login 2FA em reconexão.
+    """
     user_id = data.get('user_id')
     alias = data.get('alias')
     pub_key = data.get('pub_key')
@@ -56,46 +233,120 @@ def handle_register(data):
         return
 
     with lock:
-        # 1. Verifica se o user_id já existe (reconexão)
-        if user_id in clients:
+        existing_by_id = db_get_user_by_id(user_id)
+        existing_by_alias = db_get_user_by_alias(alias)
+
+        # Reconexão (mesmo user_id)
+        if existing_by_id:
             user_sid[user_id] = sid
             sid_user[sid] = user_id
-            
-            clients[user_id]['pub_key'] = pub_key 
-            
-            emit('register_response', {'status': 'ok', 'note': 'reconnected'})
+            db_update_pubkey(user_id, pub_key)
+            emit('register_response', {'status': 'ok', 'note': 'reconnected', 'user_id': user_id, 'alias': existing_by_id['alias']})
+
+            # Se o cliente forneceu token opcional aqui, tente autenticar e entregar
+            token = data.get('token')
+            if token:
+                try:
+                    secret = existing_by_id['totp_secret']
+                    if pyotp.TOTP(secret).verify(token):
+                        with lock:
+                            user_sid[user_id] = sid
+                            sid_user[sid] = user_id
+                        deliver_pending(user_id, sid)
+                        print(f"[2FA-auto] delivered pending on reconnection for {user_id[:8]}")
+                    else:
+                        print(f"[2FA-auto] invalid token provided on reconnection for {user_id[:8]}")
+                except Exception as e:
+                    print("Error verifying optional token on register:", e)
             return
-            
-        # --- INÍCIO DA MODIFICAÇÃO ---
-        # 2. Verifica se o ALIAS já está em uso por OUTRO user_id
-        for uid, info in clients.items():
-            if info.get('alias') == alias:
-                # Se o alias já existe, rejeita o registro
-                emit('register_response', {'error': 'Este nome de usuário já está em uso.'})
-                return
-        # --- FIM DA MODIFICAÇÃO ---
-            
-        # 3. Se for totalmente novo, registra
-        clients[user_id] = {'alias': alias, 'pub_key': pub_key}
-        messages.setdefault(user_id, [])
+
+        # se alias em uso por OUTRO user -> rejeitar
+        if existing_by_alias:
+            emit('register_response', {'error': 'Alias already in use'})
+            return
+
+        # criar novo user com TOTP
+        totp = pyotp.random_base32()
+        db_add_user(user_id, alias, pub_key, totp)
+
+        # inserir sessão
         user_sid[user_id] = sid
         sid_user[sid] = user_id
 
-    print(f"[+] {alias} registrado ({user_id[:8]})  sid={sid}")
-    emit('register_response', {'status': 'ok', 'user_id': user_id})
+    emit('register_response', {'status': 'ok', 'user_id': user_id, 'totp_secret': totp, 'alias': alias})
+    print(f"[+] {alias} registered ({user_id[:8]}) sid={sid}")
 
-    # Enviar mensagens pendentes, se houver
-    with lock:
-        pending = messages.get(user_id, [])[:]
-        messages[user_id] = []
+@socketio.on('login_2fa')
+def handle_login_2fa(data):
+    """
+    Espera: { user_id, token }
+    Se token válido: marca como online (sid já deverá ter sido atribuído em register) e entrega pendentes
+    """
+    uid = data.get('user_id')
+    token = data.get('token')
+    sid = request.sid
 
-    for m in pending:
-        emit('message', m)
+    user = db_get_user_by_id(uid)
+    if not user:
+        emit('auth_fail', {'msg': 'User not found'})
+        return
 
-# ---------------- MENSAGEM DIRETA ----------------
-@socketio.on('send')
+    secret = user['totp_secret']
+    if pyotp.TOTP(secret).verify(token):
+        with lock:
+            user_sid[uid] = sid
+            sid_user[sid] = uid
+        emit('login_success', {'alias': user['alias']})
+        # entregar pendentes
+        deliver_pending(uid, sid)
+    else:
+        emit('auth_fail', {'msg': 'Invalid token'})
+
+def deliver_pending(uid, sid):
+    """
+    Busca mensagens diretas e bundle de grupos que contenham uid e envia ao sid.
+    Depois de entregues, as mensagens diretas são removidas; mensagens de grupo são mantidas (auditável).
+    """
+    pend = db_get_pending_for_user(uid)
+    for m in pend:
+        try:
+            blob = m['content_blob']
+            if m['group_id']:
+                # bundle: extrai só o pacote do uid
+                pkt = blob.get(uid)
+                if not pkt:
+                    continue
+                payload = {
+                    'from': m['from_id'],
+                    'group': m['group_id'],
+                    'cipher': pkt.get('c'),
+                    'len': pkt.get('l'),
+                    'signature': m.get('signature')
+                }
+            else:
+                # mensagem direta
+                payload = {
+                    'from': m['from_id'],
+                    'cipher': blob.get('c') if isinstance(blob, dict) else None,
+                    'len': blob.get('l') if isinstance(blob, dict) else None,
+                    'signature': m.get('signature')
+                }
+
+            socketio.emit('message', payload, room=sid)
+        except Exception as e:
+            print(f"[ERROR] delivering pending to {uid[:8]}: {e}")
+
+    # Apaga mensagens diretas entregues (as de group_id serão mantidas para auditoria/histórico)
+    with sqlite3.connect(DB_FILE) as conn:
+        conn.execute("DELETE FROM messages WHERE to_id = ?", (uid,))
+        conn.commit()
+
+@socketio.on('send')  # mensagem direta
 def handle_send(data):
-    """Data esperado: { from_id, to_id, cipher, length, signature }"""
+    """
+    Esperado: { from_id, to_id, cipher, length, signature }
+    Salva em messages.to_id e tenta entregar se online.
+    """
     from_id = data.get('from_id')
     to_id = data.get('to_id')
     cipher = data.get('cipher')
@@ -106,27 +357,66 @@ def handle_send(data):
         emit('send_response', {'error': 'Missing fields'})
         return
 
-    with lock:
-        if to_id not in clients:
-            emit('send_response', {'error': 'User not found'})
-            return
-        alias = clients.get(from_id, {}).get('alias', from_id[:8])
-        msg = {'from': from_id, 'alias': alias, 'cipher': cipher, 'len': length, 'signature': signature} 
+    blob = {'c': cipher, 'l': length}
+    db_insert_message(from_id, to_id, None, blob, signature)
 
-        sid = user_sid.get(to_id)
-        if sid:
-            socketio.emit('message', msg, room=sid)
-            print(f"[msg] {from_id[:8]} → {to_id[:8]} (delivered live)")
-        else:
-            messages.setdefault(to_id, []).append(msg)
-            print(f"[msg] {from_id[:8]} → {to_id[:8]} (queued)")
+    sid = user_sid.get(to_id)
+    if sid:
+        socketio.emit('message', {'from': from_id, 'cipher': cipher, 'len': length, 'signature': signature}, room=sid)
+        print(f"[msg] {from_id[:8]} → {to_id[:8]} (delivered live)")
+    else:
+        print(f"[msg] {from_id[:8]} → {to_id[:8]} (queued)")
 
     emit('send_response', {'status': 'sent'})
 
-# ---------------- GRUPOS ----------------
+@socketio.on('send_group')
+def handle_send_group(data):
+    """
+    Esperado: {'from_id','group','bundle', 'signature'}
+    bundle == { user_id: {'c': '<ciphertext>', 'l': N}, ... }
+    -> salva UM ÚNICO registro com group_id preenchido (persistência de sessão/bundle).
+    -> tenta enviar para membros online extraindo apenas o pacote de cada membro.
+    """
+    from_id = data.get('from_id')
+    group = data.get('group')
+    bundle = data.get('bundle')   # dict
+    signature = data.get('signature')
+
+    if not all([from_id, group, bundle, signature]):
+        emit('send_response', {'error': 'Missing fields'})
+        return
+
+    # verificar existência do grupo e membros
+    with sqlite3.connect(DB_FILE) as conn:
+        conn.row_factory = sqlite3.Row
+        grp = conn.execute("SELECT * FROM groups WHERE name = ?", (group,)).fetchone()
+        if not grp:
+            emit('send_response', {'error': 'Group not found'})
+            return
+        members = [row[0] for row in conn.execute("SELECT user_id FROM group_members WHERE group_name=?", (group,)).fetchall()]
+
+    # salva bundle como um único registro
+    db_insert_message(from_id, None, group, bundle, signature)
+    print(f"[group] bundle saved for group {group} by {from_id[:8]}")
+
+    # entrega a cada membro online (extraíndo somente o pacote destinado)
+    for member in members:
+        if member == from_id:
+            continue
+        pkt = bundle.get(member)
+        if not pkt:
+            continue
+        sid = user_sid.get(member)
+        if sid:
+            msg = {'from': from_id, 'alias': None, 'cipher': pkt.get('c'), 'len': pkt.get('l'), 'group': group, 'signature': signature}
+            socketio.emit('message', msg, room=sid)
+            print(f"[group:E2EE:{group}] {from_id[:8]} → {member[:8]} (delivered live)")
+
+    emit('send_response', {'status': 'sent', 'group': group})
+
+# --- Gerenciamento de grupos (persistente) ---
 @socketio.on('create_group')
-def handle_create_group(data):
-    """Data esperado: { 'group': nome_grupo, 'user_id': criador, 'privacy': opcional }"""
+def create_group(data):
     group = data.get('group')
     uid = data.get('user_id')
     privacy = data.get('privacy', 'public')
@@ -135,21 +425,18 @@ def handle_create_group(data):
         emit('create_group_response', {'error': 'Missing fields'})
         return
 
-    with lock:
-        if group in groups:
-            emit('create_group_response', {'error': 'Group already exists'})
-            return
-        groups[group] = {uid}
-        group_privacy[group] = privacy
-        group_invites[group] = set()
-
-    print(f"[+] Grupo criado: {group} ({privacy}) por {uid[:8]}")
-    emit('create_group_response', {'status': 'ok', 'group': group, 'privacy': privacy})
-
+    with sqlite3.connect(DB_FILE) as conn:
+        try:
+            conn.execute("INSERT INTO groups (name, owner_id, privacy) VALUES (?, ?, ?)", (group, uid, privacy))
+            conn.execute("INSERT INTO group_members (group_name, user_id) VALUES (?, ?)", (group, uid))
+            conn.commit()
+            emit('create_group_response', {'status': 'ok', 'group': group, 'privacy': privacy})
+            print(f"[+] Grupo criado: {group} ({privacy}) por {uid[:8]}")
+        except sqlite3.IntegrityError:
+            emit('create_group_response', {'error': 'Group exists'})
 
 @socketio.on('join_group')
-def handle_join_group(data):
-    """Data esperado: { 'group': nome_grupo, 'user_id': usuario }"""
+def join_group(data):
     group = data.get('group')
     uid = data.get('user_id')
 
@@ -157,33 +444,27 @@ def handle_join_group(data):
         emit('join_group_response', {'error': 'Missing fields'})
         return
 
-    with lock:
-        if group not in groups:
-            emit('join_group_response', {'error': 'Group not found'})
+    with sqlite3.connect(DB_FILE) as conn:
+        conn.row_factory = sqlite3.Row
+        g = conn.execute("SELECT privacy FROM groups WHERE name=?", (group,)).fetchone()
+        if not g:
+            emit('join_group_response', {'error': 'Não existe'})
             return
-        
-        # Verificar se o grupo é privado
-        if group_privacy.get(group, 'public') == 'private':
-            allowed = uid in group_invites.get(group, set()) or uid in groups[group]
-            if not allowed:
-                emit('join_group_response', {'error': 'Private group — invite required'})
+        if g['privacy'] == 'private':
+            if not conn.execute("SELECT 1 FROM group_invites WHERE group_name=? AND user_id=?", (group, uid)).fetchone():
+                emit('join_group_response', {'error': 'Precisa de convite'})
                 return
-        
-        if uid in groups[group]:
+            conn.execute("DELETE FROM group_invites WHERE group_name=? AND user_id=?", (group, uid))
+        try:
+            conn.execute("INSERT INTO group_members (group_name, user_id) VALUES (?, ?)", (group, uid))
+            conn.commit()
+            emit('join_group_response', {'status': 'ok', 'group': group})
+            print(f"[+] {uid[:8]} entrou no grupo {group}")
+        except sqlite3.IntegrityError:
             emit('join_group_response', {'status': 'ok', 'group': group, 'note': 'already member'})
-            return
-            
-        groups[group].add(uid)
-        alias = clients.get(uid, {}).get('alias', uid[:8])
-        
-    print(f"[+] {uid[:8]} entrou no grupo {group}")
-    emit('join_group_response', {'status': 'ok', 'group': group})
-    _send_system_message_to_group(group, f"{alias} entrou no grupo.")
-
 
 @socketio.on('invite_user')
-def handle_invite_user(data):
-    """Data esperado: { 'group': nome_grupo, 'from_id': quem convida, 'target_alias': nome do convidado }"""
+def invite_user(data):
     group = data.get('group')
     inviter = data.get('from_id')
     target_alias = data.get('target_alias')
@@ -192,118 +473,26 @@ def handle_invite_user(data):
         emit('invite_response', {'error': 'Missing fields'})
         return
 
-    with lock:
-        if group not in groups:
+    with sqlite3.connect(DB_FILE) as conn:
+        conn.row_factory = sqlite3.Row
+        g = conn.execute("SELECT * FROM groups WHERE name=?", (group,)).fetchone()
+        if not g:
             emit('invite_response', {'error': 'Group not found'})
             return
-
-        if group_privacy.get(group, 'public') != 'private':
+        if g['privacy'] != 'private':
             emit('invite_response', {'error': 'Group is not private'})
             return
-
-        target_id = None
-        for uid, info in clients.items():
-            if info.get('alias') == target_alias:
-                target_id = uid
-                break
-
-        if not target_id:
+        tgt = conn.execute("SELECT user_id FROM users WHERE alias=?", (target_alias,)).fetchone()
+        if not tgt:
             emit('invite_response', {'error': 'User not found'})
             return
-
-        group_invites[group].add(target_id)
-
-    print(f"[INVITE] {inviter[:8]} convidou {target_alias} para o grupo {group}")
+        conn.execute("INSERT OR IGNORE INTO group_invites (group_name, user_id) VALUES (?, ?)", (group, tgt['user_id']))
+        conn.commit()
     emit('invite_response', {'status': 'ok', 'group': group, 'invited': target_alias})
+    print(f"[INVITE] {inviter[:8]} invited {target_alias} to {group}")
 
-
-@socketio.on('send_group')
-def handle_send_group(data):
-    """Data esperado: { 'from_id', 'group', 'cipher', 'length', 'signature', 'to_id' }"""
-    from_id = data.get('from_id')
-    group = data.get('group')
-    cipher = data.get('cipher')
-    length = data.get('length')
-    signature = data.get('signature')
-    to_id = data.get('to_id')
-
-    if not all([from_id, group, cipher, length, signature, to_id]):
-        emit('send_response', {'error': 'Missing fields'})
-        return
-
-    with lock:
-        if group not in groups:
-            emit('send_response', {'error': 'Group not found'})
-            return
-        
-        if from_id not in groups[group]:
-             emit('send_response', {'error': 'Sender not in group'})
-             return
-             
-        if to_id not in groups[group]:
-            return 
-            
-        alias = clients.get(from_id, {}).get('alias', from_id[:8])
-        msg = {'from': from_id, 'alias': alias, 'cipher': cipher, 'len': length, 'group': group, 'signature': signature}
-        sid = user_sid.get(to_id)
-
-        if sid:
-            socketio.emit('message', msg, room=sid)
-            print(f"[group:E2EE:{group}] {from_id[:8]} → {to_id[:8]} (delivered live)")
-        else:
-            messages.setdefault(to_id, []).append(msg)
-            print(f"[group:E2EE:{group}] {from_id[:8]} → {to_id[:8]} (queued)")
-
-    emit('send_response', {'status': 'sent', 'group': group}) 
-
-def _send_system_message_to_group(group_name, message):
-    with lock:
-        if group_name not in groups:
-            return
-        
-        members = groups[group_name].copy()
-        
-        member_keys = {}
-        for uid in members:
-            if uid in clients and 'pub_key' in clients[uid]:
-                pk = clients[uid]['pub_key']
-                # *** Nota: O paillier.py original não tinha 'e' no Pub. A versão mais nova tem.
-                # Esta função (original) pode falhar se o paillier.py for antigo.
-                # Assumindo o paillier.py mais recente que o app.py usa (com 'e')
-                e_val = int(pk.get('e', 65537)) # Pega o 'e' da pub_key
-                pub_obj = Pub(int(pk['n']), int(pk['g']), int(pk['n2']), e_val) 
-                member_keys[uid] = pub_obj
-
-    m_int = int.from_bytes(message.encode(), 'big')
-    msg_len = len(message)
-    
-    for member_id, pub_key_obj in member_keys.items():
-        try:
-            # paillier_encrypt do servidor precisa da chave pública correta
-            cipher = paillier_encrypt(pub_key_obj, m_int) 
-            
-            msg = {
-                'from': 'SYSTEM',
-                'alias': 'System',
-                'cipher': str(cipher),
-                'len': msg_len,
-                'group': group_name
-            }
-            
-            sid = user_sid.get(member_id)
-            if sid:
-                socketio.emit('message', msg, room=sid)
-        except Exception as e:
-            # Corrige a falha se o _send_system_message_to_group não tiver a biblioteca paillier.py
-            # ou se a chave pública for do formato antigo.
-            print(f"[ERROR] Falha ao criptografar/enviar mensagem do sistema para {member_id[:8]}: {e}")
-
-    print(f"[system:{group_name}] Mensagem de sistema (tentativa) enviada: {message}")
-
-# Evento para sair do grupo
 @socketio.on('leave_group')
-def handle_leave_group(data):
-    """Data esperado: { 'group': nome_grupo, 'user_id': usuario }"""
+def leave_group(data):
     group = data.get('group')
     uid = data.get('user_id')
 
@@ -311,35 +500,24 @@ def handle_leave_group(data):
         emit('leave_group_response', {'error': 'Missing fields'})
         return
 
-    with lock:
-        if group not in groups:
-            emit('leave_group_response', {'error': 'Group not found'})
-            return
-        
-        alias = clients.get(uid, {}).get('alias', uid[:8])
-        
-        if uid in groups[group]:
-            groups[group].remove(uid)
-            is_deleted = False
-            if not groups[group]:
-                del groups[group]
-                # Limpa também a privacidade e convites
-                group_privacy.pop(group, None)
-                group_invites.pop(group, None)
-                is_deleted = True
-                print(f"[-] Grupo removido: {group} (vazio)")
-                
-        else:
+    with sqlite3.connect(DB_FILE) as conn:
+        members = [r[0] for r in conn.execute("SELECT user_id FROM group_members WHERE group_name=?", (group,)).fetchall()]
+        if uid not in members:
             emit('leave_group_response', {'error': 'Not a member'})
             return
+        conn.execute("DELETE FROM group_members WHERE group_name=? AND user_id=?", (group, uid))
+        conn.commit()
+        # se vazio, remover grupo e convites
+        rem = conn.execute("SELECT 1 FROM group_members WHERE group_name=?", (group,)).fetchone()
+        if not rem:
+            conn.execute("DELETE FROM groups WHERE name=?", (group,))
+            conn.execute("DELETE FROM group_invites WHERE group_name=?", (group,))
+            conn.commit()
+            print(f"[-] Grupo removido: {group} (vazio)")
 
-    print(f"[-] {uid[:8]} saiu do grupo {group}")
     emit('leave_group_response', {'status': 'ok', 'group': group})
-    
-    if not is_deleted:
-        _send_system_message_to_group(group, f"{alias} saiu do grupo.")
+    print(f"[-] {uid[:8]} saiu do grupo {group}")
 
-# ---------------- DESCONECTAR ----------------
 @socketio.on('disconnect')
 def handle_disconnect():
     sid = request.sid
@@ -350,5 +528,5 @@ def handle_disconnect():
             print(f"[-] {uid[:8]} disconnected (sid={sid})")
 
 if __name__ == '__main__':
-    print('Starting Socket.IO server on :5000')
+    print('Starting secure messaging server on :5000')
     socketio.run(app, host='0.0.0.0', port=5000)

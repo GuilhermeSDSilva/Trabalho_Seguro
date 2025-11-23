@@ -96,7 +96,7 @@ python watchdog.py
 
 O servidor será iniciado e ficará aguardando conexões na porta 5000.
 
-###💻 2. Terminal 2: Iniciar o Frontend (Cliente)
+### 💻 2. Terminal 2: Iniciar o Frontend (Cliente)
 Navegue até a pasta frontend e execute a aplicação Streamlit:
 
 ```bash
@@ -124,11 +124,11 @@ O navegador abrirá automaticamente a interface do chat.
 
 *Caminho Alternativo*
 
-4.1. Abra o Google Authenticator no celular, escolha "Inserir chave de configuração".
+4. Abra o Google Authenticator no celular, escolha "Inserir chave de configuração".
 
-5.1 Dê um codinome a chave, digite a chave que aparece na tela e selecione a opção Tipo de Chave "Baseada no horário"
+5. Dê um codinome a chave, digite a chave que aparece na tela e selecione a opção Tipo de Chave "Baseada no horário"
 
-6.1. Digite o código de 6 dígitos gerado pelo app no campo "Token 2FA" e clique em verificar.
+6. Digite o código de 6 dígitos gerado pelo app no campo "Token 2FA" e clique em verificar.
 
 **OBS:** O algoritmo TOTP (2FA) depende da hora exata. Se o relógio do seu computador ou do celular estiverem adiantados/atrasados em mais de 30 segundos, o código falhará.
 Caso isso aconteça, sincronize o horário de sua máquina com o de seu celular

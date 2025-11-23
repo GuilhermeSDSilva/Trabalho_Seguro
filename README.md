@@ -141,22 +141,23 @@ Caso isso aconteça, sincronize o horário de sua máquina com o de seu celular
 
 3. Digite o código atual do seu autenticador (Google Authenticator) para liberar o acesso.
 
-2️⃣ Interface Principal
+## 2️⃣ Interface Principal
 
-💬 Chat:
+### 💬 Chat:
+
 A tela principal exibe as mensagens de grupos e privadas.
 
-🧭 Barra Lateral (Sidebar):
+### 🧭 Barra Lateral (Sidebar):
+
 Mostra quem você é e seu ID.
 
 Sair (Deslogar): desconecta e volta à tela de login.
 
 Atualizar Listas: atualiza as listas de usuários online e grupos disponíveis.
 
-🔔 Notificações do Sistema:
+### 🔔 Notificações do Sistema:
 
-Localizado abaixo do chat.
-Mostra logs e mensagens do sistema como:
+Localizado abaixo do chat. Mostra logs e mensagens do sistema como:
 
 "Conectado"
 
@@ -166,21 +167,56 @@ Mostra logs e mensagens do sistema como:
 
 Logs de geração de chaves
 
-3️⃣ Enviando Mensagens e Comandos
+## 3️⃣ Enviando Mensagens e Comandos
+
 Todos os comandos são digitados na caixa de texto inferior do chat.
 
 Tipo de Mensagem	Sintaxe	Exemplo
+
 💬 Privada	@usuario:mensagem	@ana:Oi, tudo bem?
+
 👥 Grupo	#grupo:mensagem	#devs:Bom dia, pessoal!
+
 ➕ Criar grupo público	/create nome_do_grupo	/create geral
+
 🔒 Criar grupo privado	/create nome_do_grupo private	/create equipe private
+
 🚪 Entrar em grupo	/join nome_do_grupo	/join geral
+
 ✉️ Convidar usuário	/invite nome_do_grupo nome_do_usuario	/invite equipe joao
+
 ❌ Sair do grupo	/leave nome_do_grupo	/leave geral
 
+## 🔍 Auditabilidade e Transparência
+
+Uma das características fundamentais deste projeto é permitir que qualquer pessoa verifique que o servidor **apenas armazena dados criptografados**. Existem duas formas de auditar o sistema:
+
+### 1. Rota de Inspeção (Inspector)
+
+O servidor possui uma rota de depuração que expõe todo o estado atual da memória e do banco de dados em formato JSON.
+
+1. Com o servidor rodando, abra o navegador.
+
+2. Acesse: `http://127.0.0.1:5000/debug/inspector`
+
+3. Você verá a lista de usuários, grupos e mensagens.
+
+   - Observe o campo **`content_blob`** nas mensagens: ele contém apenas números gigantes (cifras Paillier) e não o texto original. Isso prova que o servidor não consegue ler o que foi enviado.
+
+### 2. Inspeção Direta do Banco de Dados (SQLite)
+Como os dados são persistidos em um arquivo local, você pode abrir o banco de dados independentemente do servidor.
+
+1. Use um visualizador online como o [SQLite Viewer] (https://sqliteviewer.app/) ou Baixe uma ferramenta de visualização como o [DB Browser for SQLite](https://sqlitebrowser.org/).
+
+2. Abra o arquivo localizado em: `backend/chat_seguro.db`
+
+3. Navegue até a tabela `messages`.
+
+4. **Verificação:** Note que as colunas de conteúdo armazenam estruturas JSON com grandes inteiros cifrados, garantindo a confidencialidade dos dados em repouso.
+
 🛡️ Resumo Final:
-Este projeto garante confidencialidade, autenticidade e integridade nas comunicações,
-com criptografia Paillier e assinaturas digitais, mantendo o servidor cego para o conteúdo das mensagens.
+
+Este projeto garante confidencialidade, autenticidade, integridade e disponibilidade nas comunicações, com Criptografia Paillier, Assinatura digital, Autenticação de Dois Fatores e Mecanismo Watchdog, sempre mantendo o servidor cego para o conteúdo das mensagens.
 
 
 

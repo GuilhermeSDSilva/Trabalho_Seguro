@@ -29,7 +29,7 @@ except ImportError:
 API = "http://127.0.0.1:5000"
 WS = "http://127.0.0.1:5000"
 
-# --- NOVO: Definir a pasta de chaves ---
+# --- Definir a pasta de chaves ---
 KEYS_DIR = "keys"
 
 # --- Classe Cliente Modificada ---
@@ -125,7 +125,6 @@ class SecureChatClient:
             except Exception as e:
                 self.put_system_message(f"[ERRO AO PROCESSAR MENSAGEM] {e}")
 
-        # ... (O resto dos handlers 'on_..._response' são iguais) ...
         @self.sio.on('send_response')
         def on_send_response(data):
             if data.get('error'):
@@ -158,7 +157,7 @@ class SecureChatClient:
         def disconnect():
             self.put_system_message("[Desconectado do servidor]")
     
-    # --- Funções de Mensagem (iguais) ---
+    # --- Funções de Mensagem  ---
     def put_chat_message(self, content, sender, avatar):
         now = datetime.datetime.now().strftime("%H:%M:%S")
         self.message_queue.put({
@@ -188,8 +187,6 @@ class SecureChatClient:
             self.put_system_message(f"Erro ao buscar chaves públicas: {e}")
             return None
 
-    # *** FUNÇÕES DE IDENTIDADE MODIFICADAS ***
-
     def get_key_filename(self, alias):
         """Gera o caminho completo para o arquivo .key"""
         # Gera um nome de arquivo seguro
@@ -204,7 +201,6 @@ class SecureChatClient:
         
         filename = self.get_key_filename(self.alias)
         
-        # --- MUDANÇA AQUI ---
         # Garante que a pasta 'keys' exista
         os.makedirs(KEYS_DIR, exist_ok=True)
         
@@ -225,7 +221,6 @@ class SecureChatClient:
         """Tenta carregar uma identidade de um arquivo .key da pasta KEYS_DIR"""
         filename = self.get_key_filename(alias)
         
-        # --- MUDANÇA AQUI ---
         # Garante que a pasta 'keys' exista (para evitar erro ao verificar)
         os.makedirs(KEYS_DIR, exist_ok=True)
         
@@ -247,8 +242,7 @@ class SecureChatClient:
             self.put_system_message(f"Erro ao carregar identidade {filename}: {e}")
             return False
 
-    # *** LÓGICA DE LOGIN (Sem mudanças, mas é importante) ***
-    # (Esta função já usa as funções modificadas, então funcionará)
+    # LÓGICA DE LOGIN 
     def login(self, alias):
         with self.lock:
             if self.alias:
@@ -311,7 +305,7 @@ class SecureChatClient:
                 self.priv = None
                 return False
 
-    # --- Funções de Envio de Mensagem (Sem mudanças) ---
+    # --- Funções de Envio de Mensagem ---
     def send_dm(self, target_alias, msg):
         try:
             users = requests.get(f"{API}/users").json()['users']
@@ -410,7 +404,7 @@ class SecureChatClient:
             self.put_system_message(f"Erro ao processar comando: {e}")
 
 
-# --- Interface Streamlit (Sem NENHUMA alteração necessária aqui) ---
+# --- Interface Streamlit  ---
 def main():
     st.set_page_config(page_title="Chat Seguro", layout="wide")
 

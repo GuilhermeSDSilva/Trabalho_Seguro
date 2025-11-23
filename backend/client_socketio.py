@@ -212,10 +212,6 @@ def fetch_history(limit=200):
 
     return msgs
 
-
-# ================================================================
-# RESTO DO SEU CÓDIGO ORIGINAL (NADA ALTERADO)
-# ================================================================
 USER_KEY_CACHE = {}
 
 
@@ -247,7 +243,7 @@ def on_message(data):
         msg_bytes = dec.to_bytes(length, 'big')
         msg = msg_bytes.decode(errors='replace')
 
-        # assinaturas etc — igual seu código original
+        # assinaturas
         if sender_id != 'SYSTEM':
             sender_pub = USER_KEY_CACHE.get(sender_id)
             if not sender_pub:
@@ -295,7 +291,7 @@ def on_send_response(data):
 def main():
     global user_id, priv, pub, alias, USER_KEY_CACHE, FERNET_INSTANCE
 
-    # 🔐 NOVO — senha obrigatória antes de tudo
+    # Senha obrigatória antes de tudo
     init_master_key()
     FERNET_INSTANCE = unlock_master_key()
 
@@ -350,10 +346,6 @@ def main():
     try:
         while True:
             cmd = input('> ').strip()
-
-            # --- TODOS SEUS COMANDOS ORIGINAIS ---
-            # (nada removido)
-            # ... (igual ao seu arquivo)
 
             if cmd == '/users':
                 try:

@@ -61,7 +61,7 @@ Navegue até a pasta `backend` e execute o servidor:
 
 ```bash
 cd backend
-python server_socketio.py
+python watchdog.py
 ```
 O servidor será iniciado e ficará aguardando conexões na porta 5000.
 

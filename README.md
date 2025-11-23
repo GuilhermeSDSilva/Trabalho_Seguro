@@ -96,7 +96,7 @@ python watchdog.py
 
 O servidor será iniciado e ficará aguardando conexões na porta 5000.
 
-💻 2. Terminal 2: Iniciar o Frontend (Cliente)
+###💻 2. Terminal 2: Iniciar o Frontend (Cliente)
 Navegue até a pasta frontend e execute a aplicação Streamlit:
 
 ```bash

@@ -10,6 +10,9 @@ import pickle
 import os
 import sys
 import json
+import qrcode
+from io import BytesIO
+import base64
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
@@ -45,6 +48,10 @@ class SecureChatClient:
         self.alias = None
         self.user_key_cache = {} 
         self.lock = threading.Lock()
+
+        self.is_logged_in = False       # Novo controlo de estado real
+        self.waiting_for_2fa = False    # Indica se a UI deve mostrar o input de código
+        self.new_totp_secret = None     # Para guardar o segredo temporário no registo
         
         self.register_event = threading.Event()
         self.register_status = ""
@@ -70,16 +77,46 @@ class SecureChatClient:
                 self.put_system_message(f"[Erro de Registro] {data['error']}")
                 self.register_status = data['error']
             else:
-                self.put_system_message(f"[Registrado com sucesso] {data.get('note', '')}")
+                self.put_system_message(f"[Registrado] {data.get('note', '')}")
+
+                # SE O SERVIDOR MANDAR UM SEGREDO NOVO (NOVO REGISTO)
+                if data.get('totp_secret'):
+                    self.new_totp_secret = data.get('totp_secret')
+                    self.put_system_message("IMPORTANTE: Configure o seu 2FA agora!")
+                
+                # Após registar/reconectar, o servidor espera o 2FA
                 self.register_status = "success"
-            
-            self.register_event.set()
+                self.waiting_for_2fa = True 
+                self.register_event.set()
+
+        @self.sio.on('login_success')
+        def on_login_success(data):
+            self.is_logged_in = True
+            self.waiting_for_2fa = False
+            self.new_totp_secret = None  # Limpa o segredo da memória
+            self.put_system_message(f"Autenticação 2FA aceite! Bem-vindo {data.get('alias')}.")
+
+        @self.sio.on('auth_fail')
+        def on_auth_fail(data):
+            self.put_system_message(f"[FALHA 2FA] {data.get('msg')}")
+            # Não muda o estado, permite tentar de novo
 
         @self.sio.on('message')
         def on_message(data):
             try:
                 sender_id = data.get('from')
                 if sender_id == self.user_id:
+                    return 
+                
+                if sender_id == 'SYSTEM':
+                    content = data.get('content')
+                    group = data.get('group')
+                    
+                    sender_display = "SISTEMA"
+                    if group:
+                        sender_display += f" (no #{group})"
+                    
+                    self.put_system_message(f"[{sender_display}] {content}")
                     return 
                 
                 sender_alias = data.get('alias')
@@ -211,6 +248,13 @@ class SecureChatClient:
         filename = f"{''.join(c for c in alias if c.isalnum())}.key"
         # Retorna o caminho completo (ex: keys/Jico.key)
         return os.path.join(KEYS_DIR, filename)
+    
+    def submit_2fa(self, token):
+        if self.user_id:
+            self.sio.emit('login_2fa', {
+                'user_id': self.user_id, 
+                'token': token
+            })
 
     def save_identity(self):
         """Salva a identidade atual em um arquivo .key dentro da pasta KEYS_DIR"""
@@ -528,28 +572,82 @@ def main():
             st.session_state.system_notifications.append(msg)
         
     # --- Tela de Login ---
+    # CASO 1: Utilizador ainda não iniciou o processo de Login/Registo
     if not client.alias:
-        st.title("Trabalho Seguro - Login ou Registro")
-        alias_input = st.text_input("Seu nome de usuário:", key="alias_input")
+        st.title("Trabalho Seguro - Login ou Registo")
+        alias_input = st.text_input("Seu nome de utilizador:", key="alias_input")
         
-        if st.button("Entrar / Registrar"):
+        if st.button("Entrar / Registar"):
             if alias_input:
-                with st.spinner("Conectando..."):
+                with st.spinner("A conectar..."):
                     if client.login(alias_input):
-                        # --- CARREGAR HISTÓRICO AO LOGAR ---
-                        history = load_history(alias_input)
-                        if history:
-                            st.session_state.chat_messages = history
-                            client.put_system_message(f"Histórico carregado: {len(history)} mensagens.")
-                        
-                        st.session_state.users = requests.get(f"{API}/users").json().get('users', [])
-                        st.session_state.groups = requests.get(f"{API}/groups").json().get('groups', [])
-                        st.rerun() 
+                        st.rerun()
             else:
-                st.error("Por favor, insira um nome de usuário.")
-    
-    # --- Tela Principal do Chat ---
+                st.error("Por favor, insira um nome de utilizador.")
+
+# CASO 2: Conectado, mas aguardando 2FA (Verificação)
+    elif client.waiting_for_2fa and not client.is_logged_in:
+        st.title("Autenticação de Dois Fatores (2FA)")
+        
+        # --- MOSTRAR ERROS DO SISTEMA AQUI ---
+        if st.session_state.system_notifications:
+            last_msg = st.session_state.system_notifications[-1]
+            # Mostra erro se a última notificação for de falha
+            if "FALHA" in last_msg['content'] or "Invalid" in last_msg['content']:
+                st.error(f"{last_msg['content']}")
+        # -------------------------------------
+
+        # Se for um NOVO registo, mostramos o QR Code
+        if client.new_totp_secret:
+            st.warning("NOVO UTILIZADOR: Configure o seu autenticador agora!")
+            st.write("Escaneie este QR Code com o Google Authenticator ou Authy:")
+            
+            # Gerar QR Code
+            totp_uri = f"otpauth://totp/TrabalhoSeguro:{client.alias}?secret={client.new_totp_secret}&issuer=TrabalhoSeguro"
+            qr = qrcode.make(totp_uri)
+            img_byte_arr = BytesIO()
+            qr.save(img_byte_arr, format='PNG')
+            st.image(img_byte_arr.getvalue(), caption="Scan-me")
+            
+            st.code(client.new_totp_secret, language="text")
+            st.info("Ou digite o código acima manualmente na sua aplicação.")
+            st.divider()
+
+        st.subheader("Digite o código de 6 dígitos:")
+
+        # --- CORREÇÃO AQUI: USAR FORMULÁRIO ---
+        with st.form("form_2fa"):
+            token_input = st.text_input("Token 2FA", max_chars=6, key="token_input_form")
+            submitted = st.form_submit_button("Verificar Código", type="primary")
+            
+            if submitted:
+                if token_input:
+                    client.submit_2fa(token_input)
+                    st.toast("A verificar...", icon="⏳")
+                    # Pequeno atraso para dar tempo ao WebSocket de enviar e receber a resposta
+                    time.sleep(1)
+                    st.rerun()
+                else:
+                    st.warning("Por favor, digite o código.")
+
+# CASO 3: Logado e Autenticado (Chat Normal)
     else:
+        # --- CARREGAR HISTÓRICO SE NECESSÁRIO (Só faz uma vez) ---
+        if not st.session_state.get('history_loaded'):
+            history = load_history(client.alias)
+            if history:
+                st.session_state.chat_messages = history
+            
+            # Tenta carregar listas, sem bloquear se falhar
+            try:
+                st.session_state.users = requests.get(f"{API}/users").json().get('users', [])
+                st.session_state.groups = requests.get(f"{API}/groups").json().get('groups', [])
+            except Exception:
+                pass
+                
+            st.session_state['history_loaded'] = True
+    
+        # --- Interface Principal do Chat (Agora dentro do else correto) ---
         st.sidebar.title(f"Logado como: {client.alias[:20]}")
         st.sidebar.caption(f"ID: {client.user_id[:8]}-...")
         
@@ -557,17 +655,16 @@ def main():
         if st.sidebar.button("Sair (Deslogar)", use_container_width=True, type="primary"):
             try:
                 client.sio.disconnect()
-                client.put_system_message("Você foi desconectado.")
             except Exception as e:
                 print(f"Erro ao desconectar: {e}")
             
-            keys_to_clear = ["client", "message_queue", "chat_messages", "system_notifications", "users", "groups"]
+            # Limpa estado
+            keys_to_clear = ["client", "message_queue", "chat_messages", "system_notifications", "users", "groups", "history_loaded"]
             for key in keys_to_clear:
                 if key in st.session_state:
                     del st.session_state[key]
             st.rerun()
 
-        
         if st.sidebar.button("Atualizar Listas", use_container_width=True):
             try:
                 st.session_state.users = requests.get(f"{API}/users").json().get('users', [])

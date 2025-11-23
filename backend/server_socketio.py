@@ -176,6 +176,7 @@ def inspector():
     """
     Rota de auditoria: expõe todo o estado salvo no DB (usuarios, mensagens, grupos).
     ATENÇÃO: contém chaves públicas e secrets TOTP.
+    Link para fazer inspeção: http://192.168.0.9:5000/debug/inspector
     """
     with sqlite3.connect(DB_FILE) as conn:
         conn.row_factory = sqlite3.Row
@@ -331,6 +332,8 @@ def deliver_pending(uid, sid):
                     'len': blob.get('l') if isinstance(blob, dict) else None,
                     'signature': m.get('signature')
                 }
+            # Corrigir um erro para quando um usuário recebe as mensagens offline antes dele conseguir logar
+            socketio.sleep(100)
 
             socketio.emit('message', payload, room=sid)
         except Exception as e:
@@ -446,20 +449,49 @@ def join_group(data):
 
     with sqlite3.connect(DB_FILE) as conn:
         conn.row_factory = sqlite3.Row
+        
+        # Verifica se grupo existe e privacidade
         g = conn.execute("SELECT privacy FROM groups WHERE name=?", (group,)).fetchone()
         if not g:
             emit('join_group_response', {'error': 'Não existe'})
             return
+        
         if g['privacy'] == 'private':
             if not conn.execute("SELECT 1 FROM group_invites WHERE group_name=? AND user_id=?", (group, uid)).fetchone():
                 emit('join_group_response', {'error': 'Precisa de convite'})
                 return
             conn.execute("DELETE FROM group_invites WHERE group_name=? AND user_id=?", (group, uid))
+        
         try:
+            # Adiciona o membro
             conn.execute("INSERT INTO group_members (group_name, user_id) VALUES (?, ?)", (group, uid))
             conn.commit()
+            
+            # Resposta para quem entrou
             emit('join_group_response', {'status': 'ok', 'group': group})
             print(f"[+] {uid[:8]} entrou no grupo {group}")
+
+            # --- NOTIFICAÇÃO PARA OS OUTROS MEMBROS ---
+            # 1. Pega o apelido de quem entrou
+            user_row = conn.execute("SELECT alias FROM users WHERE user_id=?", (uid,)).fetchone()
+            alias = user_row['alias'] if user_row else "Alguém"
+
+            # 2. Pega todos os membros atuais do grupo
+            members = [row[0] for row in conn.execute("SELECT user_id FROM group_members WHERE group_name=?", (group,)).fetchall()]
+            
+            # 3. Envia aviso para cada membro (exceto o próprio usuário)
+            for m_id in members:
+                if m_id == uid: continue
+                
+                target_sid = user_sid.get(m_id)
+                if target_sid:
+                    socketio.emit('message', {
+                        'from': 'SYSTEM',
+                        'group': group,
+                        'content': f"O usuário {alias} entrou no grupo."
+                    }, room=target_sid)
+            # -------------------------------------------
+
         except sqlite3.IntegrityError:
             emit('join_group_response', {'status': 'ok', 'group': group, 'note': 'already member'})
 
@@ -501,19 +533,44 @@ def leave_group(data):
         return
 
     with sqlite3.connect(DB_FILE) as conn:
-        members = [r[0] for r in conn.execute("SELECT user_id FROM group_members WHERE group_name=?", (group,)).fetchall()]
-        if uid not in members:
+        conn.row_factory = sqlite3.Row
+        
+        # Verifica membro
+        members_check = [r[0] for r in conn.execute("SELECT user_id FROM group_members WHERE group_name=?", (group,)).fetchall()]
+        if uid not in members_check:
             emit('leave_group_response', {'error': 'Not a member'})
             return
+        
+        # Pega o alias antes de remover
+        user_row = conn.execute("SELECT alias FROM users WHERE user_id=?", (uid,)).fetchone()
+        alias = user_row['alias'] if user_row else "Alguém"
+
+        # Remove do banco
         conn.execute("DELETE FROM group_members WHERE group_name=? AND user_id=?", (group, uid))
         conn.commit()
-        # se vazio, remover grupo e convites
+
+        # Verifica se o grupo ficou vazio
         rem = conn.execute("SELECT 1 FROM group_members WHERE group_name=?", (group,)).fetchone()
+        
         if not rem:
             conn.execute("DELETE FROM groups WHERE name=?", (group,))
             conn.execute("DELETE FROM group_invites WHERE group_name=?", (group,))
             conn.commit()
             print(f"[-] Grupo removido: {group} (vazio)")
+        else:
+            # --- NOTIFICAÇÃO PARA QUEM FICOU ---
+            # Pega lista atualizada de membros remanescentes
+            remaining_members = [row[0] for row in conn.execute("SELECT user_id FROM group_members WHERE group_name=?", (group,)).fetchall()]
+            
+            for m_id in remaining_members:
+                target_sid = user_sid.get(m_id)
+                if target_sid:
+                    socketio.emit('message', {
+                        'from': 'SYSTEM',
+                        'group': group,
+                        'content': f"O usuário {alias} saiu do grupo."
+                    }, room=target_sid)
+            # -----------------------------------
 
     emit('leave_group_response', {'status': 'ok', 'group': group})
     print(f"[-] {uid[:8]} saiu do grupo {group}")
